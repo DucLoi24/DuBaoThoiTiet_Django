@@ -1,6 +1,7 @@
 # api/urls.py
 from django.urls import path
 from . import views
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 urlpatterns = [
     # Root (optional, good for testing)
@@ -22,4 +23,7 @@ urlpatterns = [
 
     # Admin Actions
     path('admin/<str:action>/', views.run_admin_action, name='run_admin_action'),
+
+    path('schema/', SpectacularAPIView.as_view(), name='api_schema'),
+    path('docs/', SpectacularSwaggerView.as_view(url_name='api_schema'), name='api_docs'),
 ]

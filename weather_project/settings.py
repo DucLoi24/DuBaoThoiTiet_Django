@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     'rest_framework', # Django Rest Framework
     'api',            # App của bạn
     'django_apscheduler', # Thư viện lập lịch (cần cài đặt: pip install django-apscheduler)
+    'drf_spectacular', # Thư viện tạo tài liệu API tự động
 ]
 
 MIDDLEWARE = [
@@ -39,6 +40,10 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+REST_FRAMEWORK = {
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
 
 ROOT_URLCONF = 'weather_project.urls'
 
