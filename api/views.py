@@ -15,7 +15,7 @@ from .scheduler import scheduler
 from django.utils import timezone
 
 from .models import User, Location, WeatherData, ExtremeEvent
-from .tasks import trigger_data_ingestion, trigger_llm_analysis
+from .tasks import trigger_data_ingestion, trigger_llm_analysis, ingest_data_for_single_location, analyze_single_location
 logger = logging.getLogger(__name__)
 
 # --- Helper Functions ---
