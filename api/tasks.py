@@ -147,7 +147,10 @@ def call_local_ai_for_analysis(time_series_data):
 
 @transaction.atomic # Đảm bảo tất cả các thao tác CSDL trong hàm này thành công hoặc thất bại cùng nhau
 def trigger_data_ingestion():
-    """ Tác vụ thu thập dữ liệu lịch sử và dự báo """
+    """ 
+    Tác vụ thu thập dữ liệu lịch sử và dự báo (Cron job chạy hàng loạt) 
+    Hàm này giờ chỉ gọi hàm con 'ingest_data_for_single_location'.
+    """
     logger.info("--- [TASK START] Running Full Data Ingestion ---")
     active_locations = Location.objects.filter(is_active=True)
     if not active_locations.exists():
@@ -155,74 +158,28 @@ def trigger_data_ingestion():
         return {'success': True, 'message': 'No active locations.'}
 
     logger.info(f"[DATA INGESTION] Found {active_locations.count()} active location(s).")
-    # Sử dụng timezone aware datetime
-    today = timezone.now().date()
-    end_date_hist = today - timedelta(days=1)
-    start_date_hist = end_date_hist - timedelta(days=6) # Lấy đúng 7 ngày lịch sử
-    dt_str = start_date_hist.strftime('%Y-%m-%d')
-    end_dt_str = end_date_hist.strftime('%Y-%m-%d')
 
-    total_stored_count = 0
-    errors_occurred = False
+    total_success = 0
+    total_fail = 0
 
+    # Vòng lặp này giờ đã sạch và đơn giản hơn rất nhiều
     for loc in active_locations:
-        all_records_to_insert = []
-        logger.info(f"[DATA INGESTION] Processing location: {loc.name_en} (ID: {loc.location_id})")
+        try:
+            # Gọi hàm con cho từng địa điểm
+            success = ingest_data_for_single_location(loc.location_id) 
+            if success:
+                total_success += 1
+            else:
+                total_fail += 1
+                logger.warning(f"[DATA INGESTION] Failed to ingest data for loc {loc.location_id} during cron job.")
+        except Exception as e:
+            # Lỗi nghiêm trọng khi chạy hàm con
+            logger.error(f"[DATA INGESTION] Critical error processing loc {loc.location_id}: {e}", exc_info=True)
+            total_fail += 1
 
-        # --- Lấy lịch sử ---
-        logger.debug(f"Fetching history for {loc.name_en} from {dt_str} to {end_dt_str}")
-        hist_data, hist_err = call_weather_api_from_task('history', {'q': loc.name_en, 'dt': dt_str, 'end_dt': end_dt_str})
-        if hist_data and 'forecast' in hist_data and 'forecastday' in hist_data['forecast']:
-            for day in hist_data['forecast']['forecastday']:
-                try:
-                    # Chuyển đổi sang datetime aware tại UTC (PostgreSQL thường lưu UTC)
-                    record_dt_naive = datetime.strptime(day['date'], '%Y-%m-%d')
-                    record_dt_aware = timezone.make_aware(record_dt_naive, dt_timezone.utc) # Lưu là UTC
-                    all_records_to_insert.append(WeatherData(
-                        location=loc, record_time=record_dt_aware, data_type='HISTORY',
-                        temp_c=day['day'].get('avgtemp_c'), humidity=day['day'].get('avghumidity'),
-                        uv_index=day['day'].get('uv'), wind_kph=day['day'].get('maxwind_kph'), raw_json=day
-                    ))
-                except (ValueError, KeyError, TypeError) as e:
-                    logger.warning(f"Skipping invalid history record for {loc.name_en} on {day.get('date')}: {e}")
-        elif hist_err:
-            errors_occurred = True
-            logger.error(f"Failed to fetch history for {loc.name_en}: {hist_err}")
-
-        # --- Lấy dự báo ---
-        logger.debug(f"Fetching 7-day forecast for {loc.name_en}")
-        fc_data, fc_err = call_weather_api_from_task('forecast', {'q': loc.name_en, 'days': 7})
-        if fc_data and 'forecast' in fc_data and 'forecastday' in fc_data['forecast']:
-            for day in fc_data['forecast']['forecastday']:
-                 try:
-                    # Chuyển đổi sang datetime aware tại UTC
-                    record_dt_naive = datetime.strptime(day['date'], '%Y-%m-%d')
-                    record_dt_aware = timezone.make_aware(record_dt_naive, dt_timezone.utc) # Lưu là UTC
-                    all_records_to_insert.append(WeatherData(
-                        location=loc, record_time=record_dt_aware, data_type='FORECAST',
-                        temp_c=day['day'].get('avgtemp_c'), humidity=day['day'].get('avghumidity'),
-                        uv_index=day['day'].get('uv'), wind_kph=day['day'].get('maxwind_kph'), raw_json=day
-                    ))
-                 except (ValueError, KeyError, TypeError) as e:
-                    logger.warning(f"Skipping invalid forecast record for {loc.name_en} on {day.get('date')}: {e}")
-        elif fc_err:
-            errors_occurred = True
-            logger.error(f"Failed to fetch forecast for {loc.name_en}: {fc_err}")
-
-        # --- Bulk insert, bỏ qua xung đột ---
-        if all_records_to_insert:
-            try:
-                # ignore_conflicts=True hoạt động dựa trên unique_together đã định nghĩa trong model
-                created_records = WeatherData.objects.bulk_create(all_records_to_insert, ignore_conflicts=True)
-                count = len(created_records)
-                total_stored_count += count
-                logger.info(f"[DATA INGESTION] Stored {count} new unique records for {loc.name_en}.")
-            except Exception as e:
-                logger.error(f"Error bulk inserting weather data for {loc.name_en}: {e}", exc_info=True)
-                errors_occurred = True
-
-    logger.info(f"--- [TASK FINISH] Data Ingestion completed. Stored {total_stored_count} new unique records total. Errors occurred: {errors_occurred} ---")
-    return {'success': not errors_occurred, 'message': f'Data Ingestion completed. Stored {total_stored_count} records.'}
+    errors_occurred = total_fail > 0
+    logger.info(f"--- [TASK FINISH] Data Ingestion completed. Succeeded for {total_success} locations. Failed for {total_fail} locations. ---")
+    return {'success': not errors_occurred, 'message': f'Data Ingestion completed. Success: {total_success}, Fail: {total_fail}.'}
 
 # --- HÀM CON ĐỂ XỬ LÝ MỘT THÀNH PHỐ (ĐỊNH NGHĨA TRƯỚC) ---
 def analyze_single_location(loc):
@@ -318,6 +275,75 @@ def trigger_llm_analysis():
     logger.info(f"--- [TASK FINISH] CONCURRENT LLM Analysis completed. Created {alerts_created_count} alerts. Critical errors: {any_critical_errors} (AI: {errors_occurred_ai}, DB: {errors_occurred_db}, Data: {errors_occurred_data}) ---")
     return {'success': not any_critical_errors, 'message': f'Concurrent analysis completed. Created {alerts_created_count} alerts.'}
 
+def ingest_data_for_single_location(location_id):
+    """ Tác vụ thu thập dữ liệu tức thì cho MỘT địa điểm mới. """
+    try:
+        loc = Location.objects.get(location_id=location_id)
+        logger.info(f"[INSTANT INGEST] Running for new location: {loc.name_en} (ID: {loc.location_id})")
+    except Location.DoesNotExist:
+        logger.error(f"[INSTANT INGEST] Location ID {location_id} not found.")
+        return False
+
+    # Lấy 7 ngày lịch sử và 7 ngày dự báo (giống hệt logic trong hàm cron)
+    today = timezone.now().date()
+    end_date_hist = today - timedelta(days=1)
+    start_date_hist = end_date_hist - timedelta(days=6)
+    dt_str = start_date_hist.strftime('%Y-%m-%d')
+    end_dt_str = end_date_hist.strftime('%Y-%m-%d')
+
+    all_records_to_insert = []
+    errors_occurred = False
+
+    # --- Lấy lịch sử ---
+    logger.debug(f"[INSTANT INGEST] Fetching history for {loc.name_en}")
+    hist_data, hist_err = call_weather_api_from_task('history', {'q': loc.name_en, 'dt': dt_str, 'end_dt': end_dt_str})
+    if hist_data and 'forecast' in hist_data and 'forecastday' in hist_data['forecast']:
+        for day in hist_data['forecast']['forecastday']:
+            try:
+                record_dt_naive = datetime.strptime(day['date'], '%Y-%m-%d')
+                record_dt_aware = timezone.make_aware(record_dt_naive, dt_timezone.utc)
+                all_records_to_insert.append(WeatherData(
+                    location=loc, record_time=record_dt_aware, data_type='HISTORY',
+                    temp_c=day['day'].get('avgtemp_c'), humidity=day['day'].get('avghumidity'),
+                    uv_index=day['day'].get('uv'), wind_kph=day['day'].get('maxwind_kph'), raw_json=day
+                ))
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning(f"[INSTANT INGEST] Skipping invalid history record for {loc.name_en} on {day.get('date')}: {e}")
+    elif hist_err:
+        errors_occurred = True
+        logger.error(f"[INSTANT INGEST] Failed to fetch history for {loc.name_en}: {hist_err}")
+
+    # --- Lấy dự báo ---
+    logger.debug(f"[INSTANT INGEST] Fetching 7-day forecast for {loc.name_en}")
+    fc_data, fc_err = call_weather_api_from_task('forecast', {'q': loc.name_en, 'days': 7})
+    if fc_data and 'forecast' in fc_data and 'forecastday' in fc_data['forecast']:
+        for day in fc_data['forecast']['forecastday']:
+             try:
+                record_dt_naive = datetime.strptime(day['date'], '%Y-%m-%d')
+                record_dt_aware = timezone.make_aware(record_dt_naive, dt_timezone.utc)
+                all_records_to_insert.append(WeatherData(
+                    location=loc, record_time=record_dt_aware, data_type='FORECAST',
+                    temp_c=day['day'].get('avgtemp_c'), humidity=day['day'].get('avghumidity'),
+                    uv_index=day['day'].get('uv'), wind_kph=day['day'].get('maxwind_kph'), raw_json=day
+                ))
+             except (ValueError, KeyError, TypeError) as e:
+                logger.warning(f"[INSTANT INGEST] Skipping invalid forecast record for {loc.name_en} on {day.get('date')}: {e}")
+    elif fc_err:
+        errors_occurred = True
+        logger.error(f"[INSTANT INGEST] Failed to fetch forecast for {loc.name_en}: {fc_err}")
+
+    # --- Bulk insert ---
+    if all_records_to_insert:
+        try:
+            created_records = WeatherData.objects.bulk_create(all_records_to_insert, ignore_conflicts=True)
+            count = len(created_records)
+            logger.info(f"[INSTANT INGEST] Stored {count} new unique records for {loc.name_en}.")
+            return True # Báo hiệu thành công
+        except Exception as e:
+            logger.error(f"[INSTANT INGEST] Error bulk inserting weather data for {loc.name_en}: {e}", exc_info=True)
+            return False # Báo hiệu thất bại
+    
+    return not errors_occurred
 
 # @transaction.atomic
 # def trigger_data_pruning():

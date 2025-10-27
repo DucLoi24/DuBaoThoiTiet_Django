@@ -11,6 +11,8 @@ import bcrypt
 import json
 import logging
 from datetime import datetime, timedelta
+from .scheduler import scheduler
+from django.utils import timezone
 
 from .models import User, Location, WeatherData, ExtremeEvent
 from .tasks import trigger_data_ingestion, trigger_llm_analysis
@@ -134,21 +136,59 @@ def track_location(request):
         return Response({"error": "Missing required parameters."}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
+        new_location_created = False # Cờ để theo dõi location mới
         with transaction.atomic():
             location, created = Location.objects.get_or_create(
                 name_en=name_en,
                 defaults={'latitude': latitude, 'longitude': longitude, 'users': [user_id]}
             )
             if not created:
-                # Cập nhật users một cách an toàn
+                # Nếu địa điểm đã tồn tại, cập nhật danh sách người theo dõi
                 current_users = set(location.users) if location.users else set()
                 current_users.add(user_id)
                 location.users = list(current_users)
                 location.is_active = True
                 location.save(update_fields=['users', 'is_active'])
+            else:
+                # Nếu địa điểm LÀ MỚI, đặt cờ
+                new_location_created = True
+
+        # === PHẦN LOGIC MỚI ĐỂ KÍCH HOẠT AI TỨC THÌ ===
+        if new_location_created:
+            new_loc_id = location.location_id
+            # Đặt lịch chạy nền (để không làm treo API)
+            run_time_ingest = timezone.now() + timedelta(seconds=10) # Chạy thu thập sau 10 giây
+            run_time_analyze = timezone.now() + timedelta(minutes=2) # Chạy AI sau 2 phút
+
+            try:
+                # Job 1: Thu thập dữ liệu
+                scheduler.add_job(
+                    ingest_data_for_single_location,
+                    'date', # Kiểu: Chạy 1 lần vào ngày giờ cụ thể
+                    run_date=run_time_ingest,
+                    args=[new_loc_id], # Tham số truyền vào hàm
+                    id=f'instant_ingest_{new_loc_id}', # ID duy nhất
+                    replace_existing=True
+                )
+                
+                # Job 2: Phân tích AI
+                scheduler.add_job(
+                    analyze_single_location, # Dùng hàm có sẵn trong tasks.py
+                    'date', 
+                    run_date=run_time_analyze,
+                    args=[location], # Hàm này nhận nguyên đối tượng location
+                    id=f'instant_analyze_{new_loc_id}',
+                    replace_existing=True
+                )
+                logger.info(f"[INSTANT TASK] Đã lên lịch phân tích tức thì cho: {name_en}")
+            except Exception as e:
+                # Lỗi này không nên cản trở việc trả về 201, chỉ log lại
+                logger.error(f"[INSTANT TASK] Lỗi khi lên lịch tác vụ cho {name_en}: {e}")
+        # === KẾT THÚC PHẦN LOGIC MỚI ===
 
         logger.info(f"[DB] Tracked location: {name_en}")
         return Response({'message': f"Location '{name_en}' activated for tracking."}, status=status.HTTP_201_CREATED)
+    
     except Exception as e:
         logger.error(f"[DB ERROR] /api/locations/track: {e}", exc_info=True)
         return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
