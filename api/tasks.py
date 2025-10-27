@@ -55,6 +55,77 @@ def call_weather_api_from_task(endpoint, params):
         logger.error(f"Unexpected error in call_weather_api_from_task: {e}", exc_info=True)
         return None, f"Unexpected Error: {e}"
 
+def call_local_ai_for_advice(hourly_time_series_data):
+    """
+    Hàm gọi API Ollama cục bộ để lấy lời khuyên hoặc cảnh báo THEO YÊU CẦU.
+    Prompt khác biệt: Ưu tiên lời khuyên, nhưng sẽ cảnh báo nếu có dấu hiệu cực đoan.
+    Trả về dict: {"type": "advice" | "warning", "message_vi": "..."} hoặc None nếu lỗi.
+    """
+    # --- PROMPT MỚI ---
+    prompt = f"""
+        **VAI TRÒ:**
+        Bạn là một trợ lý thời tiết, cung cấp thông tin hữu ích dựa trên dữ liệu CHI TIẾT THEO GIỜ. Ưu tiên sự chính xác.
+
+        **DỮ LIỆU ĐẦU VÀO:**
+        Dữ liệu thời tiết THEO GIỜ (-3 đến +3 ngày):
+        {json.dumps(hourly_time_series_data, indent=2, default=str)} 
+        # Dữ liệu gồm: 'time', 'temp_c', 'humidity', 'wind_kph', 'condition_text', 'uv'.
+
+        **NHIỆM VỤ:**
+        1.  **PHÂN TÍCH KỸ:** Xem xét diễn biến các chỉ số theo giờ. ĐẶC BIỆT CHÚ Ý đến 'condition_text'.
+        2.  **KIỂM TRA CẢNH BÁO (ƯU TIÊN):** Tìm dấu hiệu cực đoan/bất lợi kéo dài trong hôm nay hoặc vài ngày tới (nắng nóng gay gắt, rét đậm, mưa lớn/dai dẳng dựa vào 'condition_text', gió mạnh, độ ẩm bất thường).
+        3.  **HÀNH ĐỘNG:**
+            * **NẾU** có dấu hiệu cực đoan/bất lợi, CHỈ trả lời JSON cảnh báo:
+                `{{"type": "warning", "message_vi": "Cảnh báo: [Mô tả kỹ rủi ro dựa trên dữ liệu giờ]"}}`
+            * **NẾU KHÔNG** có cảnh báo, HÃY đưa ra một nhận xét ngắn gọn, thực tế về thời tiết nổi bật trong hôm nay và vài ngày tới dựa trên dữ liệu giờ (1-2 câu). ƯU TIÊN đề cập MƯA/MÂY nếu 'condition_text' cho thấy điều đó xảy ra đáng kể. Trả lời JSON lời khuyên:
+                `{{"type": "advice", "message_vi": "Lời Khuyên: [Nhận xét, lời khuyên về các hoạt động,... với thời tiết này của bạn]"}}`
+
+        **QUY TẮC:** Chỉ trả lời bằng ĐÚNG MỘT đối tượng JSON.
+    """
+    # --- KẾT THÚC PROMPT MỚI ---
+
+    try:
+        logger.debug("[LOCAL AI ADVICE] Sending advice request to Ollama...")
+        # Timeout có thể ngắn hơn cho lời khuyên, ví dụ 2 phút (120 giây)
+        response = requests.post(settings.OLLAMA_API_URL, json={
+            "model": "gemma3:4b", # llama3.1:8b, gemma3:4b
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            "keep_alive": "1h"
+        }, timeout=300) 
+        response.raise_for_status()
+
+        response_data = response.json()
+        if 'response' in response_data:
+            try:
+                # Parse JSON string từ response của Ollama
+                result_json = json.loads(response_data['response'])
+
+                # Kiểm tra cấu trúc cơ bản
+                if isinstance(result_json, dict) and "type" in result_json and "message_vi" in result_json:
+                    logger.info(f"[LOCAL AI ADVICE] Received: {result_json['type']}")
+                    return result_json # Trả về dict đã parse
+                else:
+                    logger.warning(f"[LOCAL AI ADVICE] Invalid JSON structure received: {result_json}")
+                    return None
+            except json.JSONDecodeError as e:
+                logger.error(f"[LOCAL AI ADVICE] Error parsing JSON response: {e}")
+                logger.error(f"Ollama raw response string: {response_data.get('response', 'N/A')}")
+                return None
+        else:
+            logger.warning(f"[LOCAL AI ADVICE] 'response' field missing in Ollama output: {response_data}")
+            return None
+
+    except requests.exceptions.Timeout:
+        logger.error("[LOCAL AI ADVICE] Timeout calling local Ollama API for advice.")
+        return None # Lỗi timeout trả về None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[LOCAL AI ADVICE] Error calling Ollama API: {e}")
+        return None # Lỗi kết nối trả về None
+    except Exception as e:
+        logger.error(f"[LOCAL AI ADVICE] Unexpected error: {e}", exc_info=True)
+        return None # Lỗi khác trả về None
 
 def call_local_ai_for_analysis(time_series_data):
     """
@@ -92,10 +163,11 @@ def call_local_ai_for_analysis(time_series_data):
         logger.debug("[LOCAL AI] Sending analysis request to Ollama...")
         # Tăng timeout lên 5 phút (300 giây) vì AI có thể cần nhiều thời gian
         response = requests.post(settings.OLLAMA_API_URL, json={
-            "model": "gemma3",
+            "model": "gemma3:4b",
             "prompt": prompt,
             "format": "json",
-            "stream": False
+            "stream": False,
+            "keep_alive": "1h"
         }, timeout=300)
         response.raise_for_status()
 
