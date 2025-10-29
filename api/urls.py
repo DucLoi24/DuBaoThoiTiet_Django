@@ -21,6 +21,7 @@ urlpatterns = [
     # Alerts for a specific location
     path('alerts/', views.get_alerts_for_location, name='get_alerts_for_location'),
     path('advice/', views.get_ai_advice, name='get_ai_advice'),
+    path('check-advice/', views.check_recent_advice, name='check_recent_advice'),
 
     # Tracking
     path('locations/track/', views.track_location, name='track_location'),

@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, date, timezone as dt_timezone
 from .scheduler import scheduler
 from django.utils import timezone
 from .serializers import ExtremeEventSerializer
-from .models import User, Location, WeatherData, ExtremeEvent
+from .models import User, Location, WeatherData, ExtremeEvent, AdviceCache
+from decimal import Decimal, InvalidOperation
 from .tasks import trigger_data_ingestion, trigger_llm_analysis, ingest_data_for_single_location, analyze_single_location, call_local_ai_for_advice, call_weather_api_from_task
 logger = logging.getLogger(__name__)
 
@@ -195,77 +196,125 @@ def track_location(request):
         return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
-@permission_classes([AllowAny]) # Tạm thời cho phép mọi người gọi
+@permission_classes([AllowAny])
 def get_ai_advice(request):
     """
-    API endpoint để lấy lời khuyên/cảnh báo tức thời từ AI cho một địa điểm.
-    Lấy dữ liệu THEO GIỜ (-3 đến +3 ngày) từ WeatherAPI.
-    Có cache kết quả AI trong 3 giờ.
+    API endpoint để lấy lời khuyên/cảnh báo tức thời từ AI cho một địa điểm BẤT KỲ.
+    Luôn lấy dữ liệu THEO GIỜ (-3 đến +3 ngày) trực tiếp từ WeatherAPI.
+    Có cache kết quả AI trong 3 giờ (memory cache) VÀ LƯU vào bảng AdviceCache (tự tạo Location nếu cần).
     """
     location_name_en = request.query_params.get('q')
     if not location_name_en:
         return Response({'error': "'q' query parameter (location name_en) is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    # --- Logic Cache giữ nguyên ---
+    # --- 1. Kiểm tra Cache Memory ---
     today_date_str = timezone.now().strftime('%Y-%m-%d')
+    # Key cache dùng tên địa điểm viết thường để đảm bảo tính nhất quán
     cache_key = f"ai_advice:{location_name_en.lower()}:{today_date_str}"
     cached_advice = cache.get(cache_key)
+
     if cached_advice:
         logger.info(f"[AI ADVICE CACHE HIT] Key: {cache_key}")
+        # Cập nhật timestamp trong DB nếu lấy từ cache memory
+        try:
+            # Chỉ cập nhật DB nếu Location đã tồn tại
+            location_obj_for_cache = Location.objects.filter(name_en__iexact=location_name_en).first()
+            if location_obj_for_cache:
+                advice_record, created = AdviceCache.objects.update_or_create(
+                    location=location_obj_for_cache,
+                    # Sử dụng location làm khóa chính để update_or_create hoạt động đúng
+                    # Giả định bạn chỉ muốn giữ 1 bản ghi cache mới nhất cho mỗi location
+                    # Nếu muốn tạo mới mỗi lần cache hit, dùng create() thay thế
+                    defaults={
+                       'generated_time': timezone.now(),
+                       'advice_type': cached_advice.get('type', 'unknown'),
+                       'message_vi': cached_advice.get('message_vi', '')
+                    }
+                )
+                log_action = "created" if created else "updated"
+                logger.info(f"[AI ADVICE DB] {log_action.capitalize()} AdviceCache record for {location_name_en} from memory cache hit.")
+            # Không cần else vì nếu location chưa có, cache hit cũng không giúp tạo AdviceCache
+        except Exception as e_db_update:
+             logger.error(f"[AI ADVICE DB] Error during AdviceCache update/create from memory hit for {location_name_en}: {e_db_update}", exc_info=False)
         return Response(cached_advice, status=status.HTTP_200_OK)
-    logger.info(f"[AI ADVICE CACHE MISS] Key: {cache_key}.")
-    # --- Kết thúc Cache ---
 
+    logger.info(f"[AI ADVICE CACHE MISS] Key: {cache_key}. Proceeding to fetch data and call AI.")
+
+    # --- 2. Lấy dữ liệu theo giờ từ WeatherAPI ---
     hourly_data_list = []
     api_fetch_error = False
-    
-    # --- LẤY DỮ LIỆU THEO GIỜ TỪ WEATHERAPI ---
-    logger.info(f"[AI ADVICE API - HOURLY] Fetching hourly data for {location_name_en}")
-    
-    # 1. Lấy dữ liệu lịch sử theo giờ (3 ngày trước)
+    location_lat_float = None # Lưu giá trị float gốc từ API
+    location_lon_float = None
+    location_name_actual = location_name_en # Tên thực tế từ API (có thể có dấu)
+    hist_data = None # Giữ lại response cuối cùng để lấy lat/lon nếu forecast lỗi
+    fc_data = None   # Giữ lại response forecast
+
+    logger.info(f"[AI ADVICE API - HOURLY] Fetching hourly data directly from API for query: '{location_name_en}'")
+
+    # Lấy lịch sử 3 ngày trước
     today = timezone.now().date()
     start_date_hist = today - timedelta(days=3)
-    end_date_hist = today - timedelta(days=1) # Lấy đến hết hôm qua
-
-    # API history chỉ cho lấy 1 ngày 1 lần, nên cần gọi 3 lần
+    end_date_hist = today - timedelta(days=1)
     current_hist_date = start_date_hist
     while current_hist_date <= end_date_hist:
         date_str = current_hist_date.strftime('%Y-%m-%d')
         logger.debug(f"[AI ADVICE API - HOURLY] Fetching history for {date_str}")
-        hist_data, hist_err = call_weather_api_from_task('history', {'q': location_name_en, 'dt': date_str})
-        if hist_data and 'forecast' in hist_data and 'forecastday' in hist_data['forecast']:
-            day_data = hist_data['forecast']['forecastday'][0] # Chỉ có 1 ngày trong response
-            hourly_data_list.extend(day_data.get('hour', [])) # Thêm list các giờ vào
+        hist_data_day, hist_err = call_weather_api_from_task('history', {'q': location_name_en, 'dt': date_str})
+        if hist_data_day and 'forecast' in hist_data_day and 'forecastday' in hist_data_day['forecast']:
+            day_data = hist_data_day['forecast']['forecastday'][0]
+            hourly_data_list.extend(day_data.get('hour', []))
+            hist_data = hist_data_day # Lưu lại response cuối
         else:
-            logger.warning(f"[AI ADVICE API - HOURLY] Failed to fetch history for {date_str}: {hist_err}")
-            # Có thể chấp nhận thiếu vài ngày lịch sử, không đặt cờ lỗi nặng
+            logger.warning(f"[AI ADVICE API - HOURLY] Failed/No data fetching history for {date_str}: {hist_err}")
         current_hist_date += timedelta(days=1)
 
-    # 2. Lấy dữ liệu dự báo theo giờ (Hôm nay + 3 ngày tới = 4 ngày)
+    # Lấy dự báo 4 ngày
     logger.debug(f"[AI ADVICE API - HOURLY] Fetching forecast for 4 days")
-    fc_data, fc_err = call_weather_api_from_task('forecast', {'q': location_name_en, 'days': 4}) # Lấy 4 ngày dự báo
+    fc_data, fc_err = call_weather_api_from_task('forecast', {'q': location_name_en, 'days': 4})
     if fc_data and 'forecast' in fc_data and 'forecastday' in fc_data['forecast']:
         for day_data in fc_data['forecast']['forecastday']:
-            hourly_data_list.extend(day_data.get('hour', [])) # Thêm list các giờ vào
+            hourly_data_list.extend(day_data.get('hour', []))
+        # Ưu tiên lấy lat/lon từ forecast
+        if 'location' in fc_data:
+            location_lat_float = fc_data['location'].get('lat') # Lấy dạng float
+            location_lon_float = fc_data['location'].get('lon')
+            location_name_actual = fc_data['location'].get('name', location_name_en)
+            logger.info(f"Location details from Forecast API: Name='{location_name_actual}', Lat={location_lat_float}, Lon={location_lon_float}")
     else:
-        api_fetch_error = True # Lỗi dự báo là nghiêm trọng hơn
+        api_fetch_error = True # Lỗi dự báo là nghiêm trọng
         logger.error(f"[AI ADVICE API - HOURLY] Failed to fetch forecast from API: {fc_err}")
-    
-    # --- KẾT THÚC LẤY DỮ LIỆU GIỜ ---
-    
-    if api_fetch_error or not hourly_data_list:
-        logger.error(f"[AI ADVICE API - HOURLY] Failed to fetch sufficient hourly data for {location_name_en}.")
-        return Response({"type": "error", "message_vi": "Lỗi khi lấy dữ liệu thời tiết chi tiết. Vui lòng thử lại sau."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        # Thử lấy lat/lon từ history nếu forecast lỗi
+        if hist_data and 'location' in hist_data:
+            location_lat_float = hist_data['location'].get('lat')
+            location_lon_float = hist_data['location'].get('lon')
+            location_name_actual = hist_data['location'].get('name', location_name_en)
+            logger.warning(f"Using location details from History API (fallback): Name='{location_name_actual}', Lat={location_lat_float}, Lon={location_lon_float}")
 
-    # --- Chuẩn bị dữ liệu cuối cùng cho AI (chỉ lấy các trường cần thiết) ---
+    if api_fetch_error or not hourly_data_list:
+        logger.error(f"[AI ADVICE API - HOURLY] Failed to fetch sufficient hourly forecast data for {location_name_en}.")
+        return Response({"type": "error", "message_vi": "Lỗi khi lấy dữ liệu thời tiết dự báo chi tiết. Vui lòng thử lại sau."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    # --- CHUYỂN ĐỔI SANG DECIMAL VÀ KIỂM TRA ---
+    lat_decimal = None
+    lon_decimal = None
+    if location_lat_float is not None and location_lon_float is not None:
+        try:
+            # Chuyển đổi float -> string -> Decimal để đảm bảo chính xác
+            lat_decimal = Decimal(str(location_lat_float))
+            lon_decimal = Decimal(str(location_lon_float))
+        except InvalidOperation:
+             logger.error(f"Invalid coordinate format received: lat={location_lat_float}, lon={location_lon_float}")
+             # Để lat_decimal, lon_decimal là None
+
+    if lat_decimal is None or lon_decimal is None:
+         logger.error(f"[AI ADVICE API - HOURLY] Could not determine valid Decimal coordinates for {location_name_en}.")
+         return Response({"type": "error", "message_vi": "Không thể xác định tọa độ hợp lệ cho địa điểm này."}, status=status.HTTP_404_NOT_FOUND)
+    # --- KẾT THÚC CHUYỂN ĐỔI VÀ KIỂM TRA ---
+
+    # --- 3. Chuẩn bị dữ liệu cho AI ---
     final_hourly_data_for_ai = []
     for hour in hourly_data_list:
         try:
-           # Chuyển đổi 'time' thành đối tượng datetime để sort (nếu cần) và lấy thông tin
-           # API trả về dạng "YYYY-MM-DD HH:MM"
-           record_time_naive = datetime.strptime(hour.get('time'), '%Y-%m-%d %H:%M')
-           record_time_aware = timezone.make_aware(record_time_naive) # Giả định là giờ địa phương theo TIME_ZONE
-
            final_hourly_data_for_ai.append({
                'time': hour.get('time'),
                'temp_c': hour.get('temp_c'),
@@ -275,28 +324,125 @@ def get_ai_advice(request):
                'uv': hour.get('uv'),
                'precip_mm': hour.get('precip_mm', 0.0),
                'chance_of_rain': hour.get('chance_of_rain', 0)
-               # Thêm các trường khác nếu AI cần: feelslike_c, chance_of_rain, etc.
            })
         except (ValueError, KeyError, TypeError) as e:
-           logger.warning(f"Skipping invalid hourly record: {hour.get('time')} - {e}")
-           
-    # Sắp xếp lại lần cuối theo thời gian để đảm bảo đúng thứ tự
-    final_hourly_data_for_ai.sort(key=lambda x: datetime.strptime(x['time'], '%Y-%m-%d %H:%M'))
+           logger.warning(f"Skipping invalid hourly record parsing: {hour.get('time')} - {e}")
 
-    logger.info(f"[AI ADVICE API - HOURLY] Prepared {len(final_hourly_data_for_ai)} hourly records for AI.")
-
-    # --- Gọi AI và Cache (Giữ nguyên) ---
     try:
-        advice_result = call_local_ai_for_advice(final_hourly_data_for_ai) # Gửi dữ liệu giờ cho AI
-        if advice_result:
-            cache.set(cache_key, advice_result, timeout=3 * 60 * 60)
-            logger.info(f"[AI ADVICE CACHE STORED] Key: {cache_key}")
-            return Response(advice_result, status=status.HTTP_200_OK)
-        else:
-            return Response({"type": "error", "message_vi": "Không thể kết nối với trợ lý AI lúc này."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        final_hourly_data_for_ai.sort(key=lambda x: datetime.strptime(x['time'], '%Y-%m-%d %H:%M'))
+    except ValueError:
+        logger.error(f"[AI ADVICE API - HOURLY] Error sorting hourly data for {location_name_en}.")
+        return Response({"type": "error", "message_vi": "Lỗi xử lý dữ liệu thời gian."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    logger.info(f"[AI ADVICE API - HOURLY] Prepared {len(final_hourly_data_for_ai)} hourly records for AI for '{location_name_actual}'.")
+
+    # --- 4. Gọi AI ---
+    try:
+        advice_result = call_local_ai_for_advice(final_hourly_data_for_ai) # Gọi AI
     except Exception as e:
         logger.error(f"[API ERROR] /api/advice during AI call (hourly) for {location_name_en}: {e}", exc_info=True)
         return Response({'error': 'Internal server error during AI call'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # --- 5. Xử lý kết quả AI: Lưu Cache và DB ---
+    if advice_result and advice_result.get("type") != "error":
+        # 5.1 Lưu vào Cache Memory
+        cache.set(cache_key, advice_result, timeout=3 * 60 * 60)
+        logger.info(f"[AI ADVICE CACHE STORED] Key: {cache_key}")
+
+        # 5.2 Tìm hoặc Tạo Location trong DB (Dùng giá trị Decimal)
+        location_obj = None
+        try:
+            # Dùng transaction.atomic để đảm bảo get_or_create và update (nếu có) là một khối
+            with transaction.atomic():
+                location_obj, created = Location.objects.get_or_create(
+                    name_en__iexact=location_name_en, # Tìm bằng tên không dấu
+                    defaults={
+                        'name_en': location_name_en, # Lưu tên không dấu làm key
+                        'latitude': lat_decimal,   # <-- Dùng Decimal
+                        'longitude': lon_decimal, # <-- Dùng Decimal
+                        # 'is_active': False # Mặc định không active khi tạo tự động
+                    }
+                )
+                if created:
+                    logger.info(f"[DB] Auto-created Location record for {location_name_en} (ID: {location_obj.location_id}).")
+                # Chỉ cập nhật nếu tọa độ khác biệt đáng kể
+                elif abs(location_obj.latitude - lat_decimal) > Decimal('0.001') or \
+                     abs(location_obj.longitude - lon_decimal) > Decimal('0.001'):
+                         location_obj.latitude = lat_decimal
+                         location_obj.longitude = lon_decimal
+                         location_obj.save(update_fields=['latitude', 'longitude'])
+                         logger.info(f"[DB] Updated coordinates for existing Location {location_name_en} (ID: {location_obj.location_id}).")
+
+        except Exception as loc_exc:
+            logger.error(f"[DB ERROR] Failed to get or create Location for {location_name_en}: {loc_exc}", exc_info=True)
+            location_obj = None # Đảm bảo là None nếu có lỗi
+
+        # 5.3 Lưu vào AdviceCache DB nếu có location_obj
+        if location_obj:
+            try:
+                # Tạo bản ghi mới mỗi lần AI chạy thành công
+                AdviceCache.objects.create(
+                    location=location_obj,
+                    advice_type=advice_result['type'],
+                    message_vi=advice_result['message_vi']
+                )
+                logger.info(f"[AI ADVICE DB] Stored new advice/warning in AdviceCache for {location_name_en} (Loc ID: {location_obj.location_id})")
+            except Exception as db_exc:
+                 logger.error(f"[AI ADVICE DB] Error storing advice in AdviceCache for {location_name_en}: {db_exc}", exc_info=True)
+                 # Không trả lỗi về client nếu chỉ lỗi lưu DB cache
+        else:
+             logger.warning(f"[AI ADVICE DB] Could not save to AdviceCache because Location object for {location_name_en} was not obtained/created.")
+
+        return Response(advice_result, status=status.HTTP_200_OK)
+    else:
+        # Xử lý khi AI lỗi hoặc trả về type "error"
+        error_msg = advice_result.get("message_vi") if advice_result else "Không thể kết nối với trợ lý AI lúc này."
+        logger.warning(f"[AI ADVICE] AI returned an error or no result for {location_name_en}. Message: {error_msg}")
+        return Response({"type": "error", "message_vi": error_msg}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def check_recent_advice(request):
+    """
+    API endpoint để kiểm tra xem có lời khuyên/cảnh báo nào gần đây
+    (trong vòng 1 giờ) cho địa điểm này trong AdviceCache không.
+    Trả về advice/warning nếu có, hoặc {"status": "stale"} nếu không có hoặc quá cũ.
+    """
+    location_name_en = request.query_params.get('q')
+    if not location_name_en:
+        return Response({'error': "'q' query parameter (location name_en) is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        location = Location.objects.get(name_en__iexact=location_name_en)
+
+        # Tính thời điểm 1 giờ trước
+        one_hour_ago = timezone.now() - timedelta(hours=1)
+
+        # Tìm bản ghi AdviceCache mới nhất cho location này
+        latest_advice = AdviceCache.objects.filter(
+            location=location
+        ).order_by('-generated_time').first() # Lấy bản ghi đầu tiên (mới nhất)
+
+        if latest_advice and latest_advice.generated_time >= one_hour_ago:
+            # Nếu tìm thấy và còn mới (trong vòng 1 giờ)
+            logger.info(f"[CHECK ADVICE] Found recent advice in DB for {location_name_en}")
+            return Response({
+                "type": latest_advice.advice_type,
+                "message_vi": latest_advice.message_vi,
+                "generated_time": latest_advice.generated_time # Trả thêm thời gian để debug
+            }, status=status.HTTP_200_OK)
+        else:
+            # Nếu không tìm thấy hoặc đã quá 1 giờ
+            logger.info(f"[CHECK ADVICE] No recent advice in DB for {location_name_en}. Status: stale.")
+            return Response({"status": "stale"}, status=status.HTTP_200_OK) # Dùng 200 OK để app dễ xử lý
+
+    except Location.DoesNotExist:
+         logger.warning(f"[CHECK ADVICE] Location not found: {location_name_en}")
+         # Trả về stale nếu không tìm thấy location (coi như chưa có advice)
+         return Response({"status": "stale"}, status=status.HTTP_200_OK)
+    except Exception as e:
+        logger.error(f"[API ERROR] /api/check-advice: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # --- Admin API Views (Protected) ---
 @api_view(['POST'])

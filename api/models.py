@@ -64,3 +64,19 @@ class ExtremeEvent(models.Model):
     class Meta:
         db_table = '"ExtremeEvents"'
         indexes = [ models.Index(fields=['location']), ] # Index cho location
+
+class AdviceCache(models.Model):
+    advice_id = models.BigAutoField(primary_key=True)
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='advice_cache')
+    generated_time = models.DateTimeField(default=timezone.now)
+    advice_type = models.CharField(max_length=10) # 'advice' or 'warning'
+    message_vi = models.TextField()
+    # Thêm unique constraint để đảm bảo mỗi location chỉ có 1 bản ghi cache gần nhất?
+    # Hoặc đơn giản là luôn lấy bản ghi mới nhất theo generated_time
+
+    class Meta:
+        db_table = '"AdviceCache"'
+        indexes = [
+            models.Index(fields=['location', '-generated_time']), # Index để lấy bản ghi mới nhất nhanh
+        ]
+        ordering = ['-generated_time']
