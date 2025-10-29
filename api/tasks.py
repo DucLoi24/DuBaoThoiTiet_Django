@@ -61,54 +61,38 @@ def call_local_ai_for_advice(hourly_time_series_data):
     Prompt khác biệt: Ưu tiên lời khuyên, nhưng sẽ cảnh báo nếu có dấu hiệu cực đoan.
     Trả về dict: {"type": "advice" | "warning", "message_vi": "..."} hoặc None nếu lỗi.
     """
+
+    today_str = timezone.localdate().strftime('%d/%m/%Y')
     # --- PROMPT MỚI ---
     prompt = f"""
         **VAI TRÒ:**
-        Bạn là một chuyên gia thời tiết địa phương giàu kinh nghiệm tại Việt Nam. Nhiệm vụ của bạn là phân tích dữ liệu thời tiết CHI TIẾT THEO GIỜ được cung cấp và đưa ra một ĐÁNH GIÁ TỔNG QUAN kèm theo LỜI KHUYÊN HÀNH ĐỘNG hoặc CẢNH BÁO RỦI RO cụ thể, hữu ích cho người dùng trong vài ngày tới.
+        Bạn là chuyên gia thời tiết địa phương tại Việt Nam, đưa ra lời khuyên/cảnh báo cho người dùng.
+
+        **LƯU Ý QUAN TRỌNG:** Hôm nay là ngày **{today_str}**. Hãy tập trung phân tích và đưa ra kết luận cho **HÔM NAY và 1-3 NGÀY TỚI**. Dữ liệu quá khứ chỉ dùng để tham khảo xu hướng nếu cần.
+
+        **NHIỆM VỤ:**
+        Phân tích dữ liệu thời tiết THEO GIỜ (-3 đến +3 ngày) được cung cấp. Xác định hiện tượng **ảnh hưởng nhất** đến sinh hoạt trong **HÔM NAY và VÀI NGÀY TỚI**. Tạo MỘT KẾT LUẬN DUY NHẤT (JSON) gồm `type` ("warning"/"advice") và `message_vi` (2-4 câu giải thích + lời khuyên/cảnh báo hành động).
 
         **DỮ LIỆU ĐẦU VÀO:**
-        Dữ liệu thời tiết THEO GIỜ (-3 đến +3 ngày):
+        Dữ liệu thời tiết THEO GIỜ:
         {json.dumps(hourly_time_series_data, indent=2, default=str)}
-        # Các trường dữ liệu chính: 'time', 'temp_c', 'humidity', 'wind_kph', 'condition_text' (mô tả thời tiết bằng chữ), 'uv' (chỉ số UV), 'precip_mm' (lượng mưa mm), 'chance_of_rain' (tỷ lệ mưa %).
+        # Các trường chính: 'time', 'temp_c', 'humidity', 'wind_kph', 'condition_text', 'uv', 'precip_mm', 'chance_of_rain'.
 
-        **QUY TRÌNH PHÂN TÍCH VÀ SUY LUẬN (BẮT BUỘC):**
+        **HƯỚNG DẪN SUY LUẬN & TẠO KẾT LUẬN (Tập trung vào hôm nay và dự báo):**
 
-        **Bước 1: Xác định các Hiện tượng Nổi bật (Phân tích theo từng yếu tố):**
-        * **Nhiệt độ (`temp_c`):**
-            * Nắng nóng/Oi bức: Tìm các khoảng thời gian (đặc biệt ban ngày) `temp_c` > 33°C. Ghi nhận mức độ (ví dụ: >35°C là nóng, >38°C là rất nóng). Xem xét kết hợp `humidity` > 70% để đánh giá mức độ oi bức.
-            * Lạnh/Rét: Tìm các khoảng thời gian (đặc biệt đêm/sáng) `temp_c` < 20°C. Ghi nhận mức độ (ví dụ: <15°C là rét, <13°C là rét đậm).
-            * Biến động: Nhiệt độ có thay đổi lớn giữa ngày và đêm không (> 8-10°C)?
-        * **Độ ẩm (`humidity`):**
-            * Ẩm ướt kéo dài: Tìm các khoảng thời gian `humidity` > 90% liên tục nhiều giờ.
-            * Khô hanh: Tìm các khoảng thời gian `humidity` < 40% liên tục nhiều giờ (hiếm ở VN nhưng cần kiểm tra).
-        * **Mưa (`precip_mm`, `chance_of_rain`, `condition_text`):**
-            * Xác định kiểu mưa: Dựa vào `condition_text` (ví dụ: "Light rain" - mưa nhỏ, "Moderate rain" - mưa vừa, "Heavy rain" - mưa to, "Patchy rain possible" - có thể mưa rào nhẹ, "Thunderstorm" - mưa dông).
-            * Đánh giá cường độ và thời gian: Xem `precip_mm` (>1mm/giờ là đáng kể, >5mm/giờ là mưa khá to). Xem `chance_of_rain` (>50% là khả năng cao). Mưa kéo dài bao lâu? Có tập trung vào thời điểm cụ thể (sáng, chiều, đêm) không?
-        * **Gió (`wind_kph`):**
-            * Gió mạnh/Gió giật: Tìm các khoảng thời gian `wind_kph` > 30 km/h. Ghi nhận mức độ (ví dụ: >45 km/h là gió mạnh, >60 km/h là rất mạnh). Có đi kèm mưa dông không?
-        * **Bức xạ UV (`uv`):**
-            * Mức độ cao: Tìm các khoảng thời gian (thường 10h-15h) `uv` > 7. Ghi nhận mức độ (ví dụ: >9 là rất cao). Trời có nắng (`condition_text` là "Sunny", "Clear") không?
-        * **Hiện tượng khác (từ `condition_text`):**
-            * Sương mù ("Mist", "Fog")?
-            * Dông, sấm chớp ("Thunder")?
+        **A. ƯU TIÊN KIỂM TRA CẢNH BÁO (trong hôm nay & 3 ngày tới):**
+        * **Mưa Lớn/Ngập/Dông Sét Kéo Dài:** (Kiểm tra dữ liệu giờ của hôm nay và 3 ngày tới xem có dấu hiệu không). => Nếu có, kết luận `warning`.
+        * **Nắng Nóng Gay Gắt/Oi Bức:** (Kiểm tra dữ liệu giờ ban ngày của hôm nay và 3 ngày tới). => Nếu có, kết luận `warning`.
+        * **Gió Rất Mạnh/Giật:** (Kiểm tra dữ liệu giờ của hôm nay và 3 ngày tới). => Nếu có, kết luận `warning`.
+        * **Rét Đậm/Rét Hại:** (Kiểm tra dữ liệu giờ của hôm nay và 3 ngày tới). => Nếu có, kết luận `warning`.
 
-        **Bước 2: Tổng hợp và Xác định Kịch bản Chính:**
-        * Dựa trên các hiện tượng nổi bật đã xác định, KỊCH BẢN THỜI TIẾT CHỦ ĐẠO trong 1-3 ngày tới là gì?
-            * Ví dụ: "Nắng nóng kèm oi bức vào ban ngày, chiều tối có khả năng mưa dông", "Trời nhiều mây, mưa ẩm kéo dài", "Ngày nắng đêm lạnh", "Gió mùa đông bắc gây rét", "Thời tiết ổn định, nắng nhẹ".
-        * **ƯU TIÊN CẢNH BÁO:** Nếu có bất kỳ hiện tượng nào đạt ngưỡng nguy hiểm (nắng nóng >38°C kéo dài, mưa rất to >10mm/giờ, gió >60 km/h, rét đậm <13°C kéo dài), kịch bản chính PHẢI LÀ CẢNH BÁO về hiện tượng đó.
-
-        **Bước 3: Đưa ra Kết luận và Lời khuyên/Cảnh báo:**
-        * Dựa vào Kịch bản Chính đã xác định:
-            * **Nếu là CẢNH BÁO:** Phát biểu rõ ràng về rủi ro chính và đưa ra lời khuyên hành động cụ thể để phòng tránh. Phân loại là `"warning"`.
-            * **Nếu KHÔNG có cảnh báo:** Phát biểu về kịch bản thời tiết chính và đưa ra 1-2 lời khuyên hành động thiết thực liên quan đến kịch bản đó (ví dụ: trang phục, hoạt động phù hợp, sức khỏe). Phân loại là `"advice"`.
-        * **Yêu cầu về nội dung:**
-            * Sử dụng ngôn ngữ tự nhiên, dễ hiểu, phù hợp với người Việt.
-            * Lời khuyên/cảnh báo phải cụ thể, có tính hành động.
-            * Nội dung phải logic, nhất quán với dữ liệu phân tích. **Tuyệt đối không bịa đặt hoặc đưa thông tin trái ngược dữ liệu (ví dụ: nói nắng gắt khi dữ liệu báo mưa ẩm).**
+        **B. NẾU KHÔNG CÓ CẢNH BÁO (Tạo lời khuyên cho hôm nay & 1-2 ngày tới):**
+        * Xác định Kịch bản Chính cho **hôm nay và 1-2 ngày tới**.
+        * Tạo `advice` tập trung vào kịch bản đó kèm lời khuyên hành động cụ thể.
 
         **YÊU CẦU ĐẦU RA:**
-        Chỉ trả lời bằng ĐÚNG MỘT đối tượng JSON theo cấu trúc sau, **KHÔNG SỬ DỤNG LẠI CÁC CÂU VÍ DỤ TRONG PHẦN MÔ TẢ NÀY**:
-        `{{"type": "warning" | "advice", "message_vi": "[Nội dung đánh giá tổng quan KÈM lời khuyên hành động / cảnh báo chi tiết dựa trên phân tích của bạn]"}}`
+        JSON duy nhất: `{{"type": "warning" | "advice", "message_vi": "[Kết luận + Lời khuyên hoặc Cảnh báo tập trung vào hôm nay và tương lai gần]"}}`.
+        **TUYỆT ĐỐI KHÔNG LẶP LẠI VÍ DỤ. TỰ DIỄN ĐẠT.**
     """
     # --- KẾT THÚC PROMPT MỚI ---
 
@@ -116,7 +100,7 @@ def call_local_ai_for_advice(hourly_time_series_data):
         logger.debug("[LOCAL AI ADVICE] Sending advice request to Ollama...")
         # Timeout có thể ngắn hơn cho lời khuyên, ví dụ 2 phút (120 giây)
         response = requests.post(settings.OLLAMA_API_URL, json={
-            "model": "gemma3:4b", # llama3.1:8b, gemma3:4b
+            "model": "gemma3:4b", # llama3.1:8b, gemma3:4b, deepseek-r1:7b
             "prompt": prompt,
             "format": "json",
             "stream": False,
