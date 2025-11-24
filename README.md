@@ -445,10 +445,6 @@ python manage.py shell
 >>> cache.clear()
 ```
 
-## 📝 License
-
-Private Project
-
 ## 👥 Contributors
 
 - Development Team
