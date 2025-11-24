@@ -27,9 +27,27 @@ class Location(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     # Cho phép users là null hoặc rỗng
     users = JSONField(default=list, blank=True, null=True)
+    # Lưu trạng thái thời tiết hiện tại để so sánh
+    last_weather_condition = models.CharField(max_length=100, null=True, blank=True)
+    last_weather_check = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = '"Locations"'
+
+class DeviceToken(models.Model):
+    """Lưu FCM device tokens của users"""
+    token_id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='device_tokens')
+    token = models.CharField(max_length=255, unique=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = '"DeviceTokens"'
+        indexes = [
+            models.Index(fields=['user', 'is_active']),
+        ]
 
 class WeatherData(models.Model):
     weather_data_id = models.BigAutoField(primary_key=True)
@@ -80,3 +98,154 @@ class AdviceCache(models.Model):
             models.Index(fields=['location', '-generated_time']), # Index để lấy bản ghi mới nhất nhanh
         ]
         ordering = ['-generated_time']
+
+
+class NotificationPreferences(models.Model):
+    """Lưu trữ preferences thông báo của user"""
+    preference_id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notification_preferences')
+    
+    # Global notification toggle
+    notifications_enabled = models.BooleanField(default=True)
+    
+    # Event type preferences (JSON array of enabled types)
+    enabled_event_types = JSONField(default=list)  # ['heavy_rain', 'storm', 'extreme_heat', ...]
+    
+    # Schedule preferences
+    notification_schedule = models.CharField(max_length=20, default='24_7')  # '24_7' or 'daytime_only'
+    
+    # Scheduled notification preferences
+    morning_summary_enabled = models.BooleanField(default=True)
+    tomorrow_forecast_enabled = models.BooleanField(default=True)
+    weekly_summary_enabled = models.BooleanField(default=False)
+    
+    # Timezone
+    timezone = models.CharField(max_length=50, default='Asia/Ho_Chi_Minh')
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'NotificationPreferences'
+
+
+class LocationNotificationPreferences(models.Model):
+    """Preferences thông báo cho từng location cụ thể"""
+    id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='location_notification_preferences')
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='notification_preferences')
+    
+    notifications_enabled = models.BooleanField(default=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'LocationNotificationPreferences'
+        unique_together = ('user', 'location')
+
+
+class WeatherAlert(models.Model):
+    """Lưu trữ các cảnh báo thời tiết được phát hiện"""
+    alert_id = models.BigAutoField(primary_key=True)
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='weather_alerts')
+    
+    alert_type = models.CharField(max_length=50)  # 'heavy_rain', 'storm', 'extreme_heat', 'extreme_cold'
+    severity = models.CharField(max_length=20)  # 'high', 'medium', 'low'
+    
+    detected_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    
+    # Alert details
+    title_vi = models.CharField(max_length=200)
+    message_vi = models.TextField()
+    recommended_actions = models.TextField(null=True, blank=True)
+    
+    # Weather data at time of alert
+    weather_data = JSONField()
+    
+    class Meta:
+        db_table = 'WeatherAlerts'
+        indexes = [
+            models.Index(fields=['location', '-detected_at']),
+            models.Index(fields=['is_active']),
+        ]
+
+
+class NotificationRecord(models.Model):
+    """Lịch sử các thông báo đã gửi"""
+    record_id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notification_records')
+    location = models.ForeignKey(Location, on_delete=models.SET_NULL, null=True, blank=True, related_name='notification_records')
+    
+    notification_type = models.CharField(max_length=50)  # 'alert', 'morning_summary', 'tomorrow_forecast', 'weekly_summary'
+    alert = models.ForeignKey(WeatherAlert, on_delete=models.SET_NULL, null=True, blank=True, related_name='notification_records')
+    
+    title = models.CharField(max_length=200)
+    body = models.TextField()
+    priority = models.CharField(max_length=20)  # 'high', 'medium', 'low'
+    
+    sent_at = models.DateTimeField(auto_now_add=True)
+    delivered = models.BooleanField(default=False)
+    
+    # FCM response
+    fcm_message_id = models.CharField(max_length=255, null=True, blank=True)
+    
+    class Meta:
+        db_table = 'NotificationRecords'
+        indexes = [
+            models.Index(fields=['user', '-sent_at']),
+            models.Index(fields=['notification_type']),
+        ]
+
+
+class QueuedNotification(models.Model):
+    """Thông báo được xếp hàng để gửi sau"""
+    queue_id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='queued_notifications')
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, null=True, blank=True, related_name='queued_notifications')
+    
+    notification_type = models.CharField(max_length=50)
+    title = models.CharField(max_length=200)
+    body = models.TextField()
+    priority = models.CharField(max_length=20)
+    data = JSONField(default=dict)
+    
+    scheduled_for = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent = models.BooleanField(default=False)
+    
+    class Meta:
+        db_table = 'QueuedNotifications'
+        indexes = [
+            models.Index(fields=['scheduled_for', 'sent']),
+        ]
+
+
+class PreferenceAuditLog(models.Model):
+    """Audit log cho các thay đổi notification preferences"""
+    log_id = models.BigAutoField(primary_key=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='preference_audit_logs')
+    
+    # Loại preference được thay đổi
+    preference_type = models.CharField(max_length=50)  # 'global' hoặc 'location'
+    location = models.ForeignKey(Location, on_delete=models.SET_NULL, null=True, blank=True, related_name='preference_audit_logs')
+    
+    # Thông tin thay đổi
+    field_name = models.CharField(max_length=100)  # Tên field được thay đổi
+    old_value = JSONField(null=True, blank=True)  # Giá trị cũ
+    new_value = JSONField(null=True, blank=True)  # Giá trị mới
+    
+    # Metadata
+    changed_at = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(null=True, blank=True)
+    
+    class Meta:
+        db_table = 'PreferenceAuditLogs'
+        indexes = [
+            models.Index(fields=['user', '-changed_at']),
+            models.Index(fields=['preference_type']),
+        ]
+        ordering = ['-changed_at']

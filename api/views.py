@@ -311,20 +311,29 @@ def get_ai_advice(request):
          return Response({"type": "error", "message_vi": "Không thể xác định tọa độ hợp lệ cho địa điểm này."}, status=status.HTTP_404_NOT_FOUND)
     # --- KẾT THÚC CHUYỂN ĐỔI VÀ KIỂM TRA ---
 
-    # --- 3. Chuẩn bị dữ liệu cho AI ---
+    # --- 3. Chuẩn bị dữ liệu cho AI (CHỈ LẤY HÔM NAY + 2 NGÀY TỚI = 72 GIỜ) ---
     final_hourly_data_for_ai = []
+    now = timezone.now()
+    cutoff_time = now + timedelta(days=2, hours=12)  # Chỉ lấy đến 2.5 ngày tới
+    
     for hour in hourly_data_list:
         try:
-           final_hourly_data_for_ai.append({
-               'time': hour.get('time'),
-               'temp_c': hour.get('temp_c'),
-               'humidity': hour.get('humidity'),
-               'wind_kph': hour.get('wind_kph'),
-               'condition_text': hour.get('condition', {}).get('text'),
-               'uv': hour.get('uv'),
-               'precip_mm': hour.get('precip_mm', 0.0),
-               'chance_of_rain': hour.get('chance_of_rain', 0)
-           })
+            hour_time_str = hour.get('time')
+            hour_time = datetime.strptime(hour_time_str, '%Y-%m-%d %H:%M')
+            hour_time = timezone.make_aware(hour_time) if timezone.is_naive(hour_time) else hour_time
+            
+            # CHỈ LẤY DỮ LIỆU TỪ HÔM NAY TRỞ ĐI (bỏ quá khứ)
+            if hour_time >= now and hour_time <= cutoff_time:
+                final_hourly_data_for_ai.append({
+                    'time': hour_time_str,
+                    'temp_c': hour.get('temp_c'),
+                    'humidity': hour.get('humidity'),
+                    'wind_kph': hour.get('wind_kph'),
+                    'condition_text': hour.get('condition', {}).get('text'),
+                    'uv': hour.get('uv'),
+                    'precip_mm': hour.get('precip_mm', 0.0),
+                    'chance_of_rain': hour.get('chance_of_rain', 0)
+                })
         except (ValueError, KeyError, TypeError) as e:
            logger.warning(f"Skipping invalid hourly record parsing: {hour.get('time')} - {e}")
 
@@ -334,7 +343,7 @@ def get_ai_advice(request):
         logger.error(f"[AI ADVICE API - HOURLY] Error sorting hourly data for {location_name_en}.")
         return Response({"type": "error", "message_vi": "Lỗi xử lý dữ liệu thời gian."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    logger.info(f"[AI ADVICE API - HOURLY] Prepared {len(final_hourly_data_for_ai)} hourly records for AI for '{location_name_actual}'.")
+    logger.info(f"[AI ADVICE API - HOURLY] Prepared {len(final_hourly_data_for_ai)} hourly records (next 2.5 days only) for AI for '{location_name_actual}'.")
 
     # --- 4. Gọi AI ---
     try:
@@ -459,6 +468,11 @@ def run_admin_action(request, action):
         elif action == 'run-analysis':
             result = trigger_llm_analysis()
             success = result.get('success', False)
+        elif action == 'check-alerts':
+            # ENDPOINT MỚI: Kiểm tra cảnh báo thiên tai ngay lập tức
+            from .tasks import monitor_all_locations_for_alerts
+            result = monitor_all_locations_for_alerts()
+            success = result.get('success', False)
         # elif action == 'run-pruning':
         #     result = trigger_data_pruning()
         #     success = result.get('success', False)
@@ -520,3 +534,798 @@ def get_alerts_for_location(request):
     except Exception as e:
         logger.error(f"[API ERROR] /api/alerts: {e}", exc_info=True)
         return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+@api_view(['GET'])
+@permission_classes([AllowAny]) # Sau này nên đổi thành IsAuthenticated
+def get_tracked_locations(request):
+    user_id = request.query_params.get('user_id')
+    if not user_id:
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        # Chuyển user_id sang int để tìm trong JSONField (vì database lưu int)
+        user_id_int = int(user_id)
+        
+        # Tìm các Location mà trong mảng 'users' có chứa user_id này
+        # Lưu ý: Query này áp dụng cho PostgreSQL với JSONField
+        locations = Location.objects.filter(users__contains=user_id_int)
+        
+        results = []
+        
+        for loc in locations:
+            # Với mỗi địa điểm, lấy dữ liệu thời tiết (Ưu tiên Cache)
+            # Gọi hàm get_weather logic hoặc gọi lại call_weather_api
+            # Ở đây ta gọi API forecast 1 ngày để lấy đủ thông tin: Mưa (forecast), Gió (current)
+            
+            cache_key = f"tracked:{loc.name_en}"
+            weather_data = cache.get(cache_key)
+            
+            if not weather_data:
+                # Nếu không có cache, gọi WeatherAPI
+                params = {'q': loc.name_en, 'days': 1, 'lang': 'vi'}
+                status_code, api_data = call_weather_api('forecast', params)
+                
+                if status_code == 200:
+                    weather_data = api_data
+                    cache.set(cache_key, weather_data, timeout=300) # Cache 5 phút
+            
+            if weather_data:
+                # Trích xuất dữ liệu cần thiết
+                current = weather_data.get('current', {})
+                forecast = weather_data.get('forecast', {}).get('forecastday', [{}])[0].get('day', {})
+                
+                results.append({
+                    'id': loc.location_id,
+                    'name': weather_data.get('location', {}).get('name', loc.name_en),
+                    'temp_c': current.get('temp_c'),
+                    'condition_text': current.get('condition', {}).get('text'),
+                    'icon': current.get('condition', {}).get('icon'),
+                    'wind_kph': current.get('wind_kph'),
+                    'chance_of_rain': forecast.get('daily_chance_of_rain', 0), # Lấy tỉ lệ mưa từ dự báo ngày
+                    'humidity': current.get('humidity')
+                })
+
+        return Response(results, status=status.HTTP_200_OK)
+
+    except ValueError:
+        return Response({'error': 'Invalid user_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"Error fetching tracked locations: {e}", exc_info=True)
+        return Response({'error': 'Internal Server Error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@api_view(['POST', 'DELETE'])
+# Cần thêm @permission_classes([IsAuthenticated]) sau này
+def register_device_token(request):
+    """
+    API endpoint để quản lý FCM device token
+    
+    POST: Đăng ký hoặc cập nhật device token
+        Body: {"user_id": int, "token": str}
+        
+    DELETE: Xóa device token (đánh dấu không active)
+        Body: {"user_id": int, "token": str}
+    """
+    from .models import DeviceToken, NotificationPreferences
+    from .preference_manager import UserPreferenceManager
+    
+    user_id = request.data.get('user_id')
+    token = request.data.get('token')
+    
+    if not user_id or not token:
+        return Response({'error': 'user_id and token are required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user_id = int(user_id)
+        
+        # Kiểm tra user có tồn tại không
+        try:
+            user = User.objects.get(user_id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        if request.method == 'POST':
+            # Đăng ký hoặc cập nhật device token
+            with transaction.atomic():
+                # Tìm hoặc tạo device token
+                device_token, created = DeviceToken.objects.update_or_create(
+                    token=token,
+                    defaults={
+                        'user': user,
+                        'is_active': True
+                    }
+                )
+                
+                # Nếu token đã tồn tại nhưng thuộc về user khác, cập nhật user mới
+                if not created and device_token.user_id != user_id:
+                    logger.warning(f"[DEVICE TOKEN] Token {token[:20]}... moved from user {device_token.user_id} to user {user_id}")
+                    device_token.user = user
+                    device_token.is_active = True
+                    device_token.save()
+                
+                # Đảm bảo user có notification preferences
+                # Nếu chưa có, tạo preferences mặc định
+                preference_manager = UserPreferenceManager()
+                preferences = preference_manager.get_user_preferences(user_id)
+                
+                if not preferences:
+                    # Tạo preferences mặc định
+                    default_preferences = {
+                        'enabled_event_types': ['heavy_rain', 'storm', 'extreme_heat', 'extreme_cold'],
+                        'notification_schedule': '24_7',
+                        'morning_summary_enabled': True,
+                        'tomorrow_forecast_enabled': True,
+                        'weekly_summary_enabled': False,
+                        'timezone': 'Asia/Ho_Chi_Minh'
+                    }
+                    preferences = preference_manager.update_preferences(user_id, default_preferences)
+                    logger.info(f"[DEVICE TOKEN] Created default notification preferences for user {user_id}")
+                
+                # Dọn dẹp các token cũ không active của user này (giữ tối đa 5 tokens active)
+                active_tokens = DeviceToken.objects.filter(
+                    user=user,
+                    is_active=True
+                ).order_by('-updated_at')
+                
+                if active_tokens.count() > 5:
+                    # Giữ 5 tokens mới nhất, đánh dấu các tokens cũ là inactive
+                    old_tokens = active_tokens[5:]
+                    old_token_ids = [t.token_id for t in old_tokens]
+                    DeviceToken.objects.filter(token_id__in=old_token_ids).update(is_active=False)
+                    logger.info(f"[DEVICE TOKEN] Deactivated {len(old_token_ids)} old tokens for user {user_id}")
+            
+            action = "registered" if created else "updated"
+            logger.info(f"[DEVICE TOKEN] {action} for user {user_id}: {token[:20]}...")
+            
+            return Response({
+                'message': f'Device token {action} successfully',
+                'token_id': device_token.token_id,
+                'has_preferences': preferences is not None
+            }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+        
+        elif request.method == 'DELETE':
+            # Xóa (deactivate) device token
+            try:
+                device_token = DeviceToken.objects.get(
+                    token=token,
+                    user=user
+                )
+                device_token.is_active = False
+                device_token.save()
+                
+                logger.info(f"[DEVICE TOKEN] Deactivated token for user {user_id}: {token[:20]}...")
+                
+                return Response({
+                    'message': 'Device token deactivated successfully'
+                }, status=status.HTTP_200_OK)
+                
+            except DeviceToken.DoesNotExist:
+                return Response({
+                    'error': 'Device token not found for this user'
+                }, status=status.HTTP_404_NOT_FOUND)
+    
+    except ValueError:
+        return Response({'error': 'Invalid user_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"[DEVICE TOKEN] Error: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def test_notification(request):
+    """
+    Test endpoint để gửi notification thử
+    Body: {"user_id": int, "title": str, "body": str}
+    """
+    from .firebase_notifications import send_fcm_notification
+    from .models import DeviceToken
+    
+    user_id = request.data.get('user_id')
+    title = request.data.get('title', 'Test Notification')
+    body = request.data.get('body', 'This is a test notification')
+    
+    if not user_id:
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        # Lấy device tokens của user
+        tokens = list(DeviceToken.objects.filter(
+            user_id=user_id,
+            is_active=True
+        ).values_list('token', flat=True))
+        
+        if not tokens:
+            return Response({
+                'error': 'No device tokens found for this user',
+                'user_id': user_id
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Gửi notification
+        result = send_fcm_notification(
+            device_tokens=tokens,
+            title=title,
+            body=body,
+            data={'type': 'test'}
+        )
+        
+        return Response({
+            'message': 'Test notification sent',
+            'result': result,
+            'tokens_count': len(tokens)
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        logger.error(f"[TEST NOTIFICATION] Error: {e}", exc_info=True)
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# --- Notification Preferences API Views ---
+
+@api_view(['GET', 'POST'])
+# Cần thêm @permission_classes([IsAuthenticated]) sau này
+def notification_preferences(request):
+    """
+    GET: Lấy notification preferences của user
+    POST: Cập nhật notification preferences của user
+    Query params: user_id (int)
+    """
+    from .serializers import NotificationPreferencesSerializer
+    from .models import NotificationPreferences
+    from .preference_manager import UserPreferenceManager
+    
+    # Lấy user_id từ query params cho cả GET và POST
+    user_id = request.query_params.get('user_id')
+    
+    logger.info(f"[PREFERENCES API] Request method: {request.method}, user_id: {user_id}")
+    
+    if not user_id:
+        logger.warning(f"[PREFERENCES API] Missing user_id in request")
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user_id = int(user_id)
+        
+        # Kiểm tra user có tồn tại không
+        try:
+            user = User.objects.get(user_id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        if request.method == 'GET':
+            # Lấy preferences của user
+            preference_manager = UserPreferenceManager()
+            preferences = preference_manager.get_user_preferences(user_id)
+            
+            if preferences:
+                serializer = NotificationPreferencesSerializer(preferences)
+                logger.info(f"[PREFERENCES API] Retrieved preferences for user {user_id}")
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            else:
+                # Nếu chưa có preferences, trả về empty với status 200
+                return Response({
+                    'message': 'No preferences found. Default preferences will be created on first update.',
+                    'user_id': user_id
+                }, status=status.HTTP_200_OK)
+        
+        elif request.method == 'POST':
+            # Cập nhật preferences
+            # Log request data để debug
+            logger.info(f"[PREFERENCES API] Received data: {request.data}")
+            logger.info(f"[PREFERENCES API] User ID: {user_id}")
+            
+            preference_data = {}
+            
+            # Xử lý từng field riêng để tránh filter nhầm boolean False
+            if 'notifications_enabled' in request.data:
+                preference_data['notifications_enabled'] = request.data.get('notifications_enabled')
+            
+            if 'enabled_event_types' in request.data:
+                preference_data['enabled_event_types'] = request.data.get('enabled_event_types')
+            
+            if 'notification_schedule' in request.data:
+                preference_data['notification_schedule'] = request.data.get('notification_schedule')
+            
+            if 'morning_summary_enabled' in request.data:
+                preference_data['morning_summary_enabled'] = request.data.get('morning_summary_enabled')
+            
+            if 'tomorrow_forecast_enabled' in request.data:
+                preference_data['tomorrow_forecast_enabled'] = request.data.get('tomorrow_forecast_enabled')
+            
+            if 'weekly_summary_enabled' in request.data:
+                preference_data['weekly_summary_enabled'] = request.data.get('weekly_summary_enabled')
+            
+            if 'timezone' in request.data:
+                preference_data['timezone'] = request.data.get('timezone')
+            else:
+                preference_data['timezone'] = 'Asia/Ho_Chi_Minh'
+            
+            logger.info(f"[PREFERENCES API] Processed preference_data: {preference_data}")
+            
+            if not preference_data:
+                logger.warning(f"[PREFERENCES API] No preference data provided for user {user_id}")
+                return Response({'error': 'No preference data provided'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Sử dụng UserPreferenceManager để cập nhật (truyền request để audit logging)
+            preference_manager = UserPreferenceManager()
+            
+            try:
+                updated_preferences = preference_manager.update_preferences(
+                    user_id, 
+                    preference_data,
+                    request=request  # Truyền request để audit logging
+                )
+                serializer = NotificationPreferencesSerializer(updated_preferences)
+                
+                logger.info(f"[PREFERENCES API] Updated preferences for user {user_id}")
+                return Response({
+                    'message': 'Preferences updated successfully',
+                    'preferences': serializer.data
+                }, status=status.HTTP_200_OK)
+                
+            except Exception as validation_error:
+                logger.error(f"[PREFERENCES API] Validation error for user {user_id}: {validation_error}")
+                return Response({
+                    'error': 'Invalid preference data',
+                    'details': str(validation_error)
+                }, status=status.HTTP_400_BAD_REQUEST)
+    
+    except ValueError:
+        return Response({'error': 'Invalid user_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"[PREFERENCES API] Error: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET', 'POST'])
+# Cần thêm @permission_classes([IsAuthenticated]) sau này
+def location_notification_preferences(request, location_id):
+    """
+    GET: Lấy notification preferences cho một location cụ thể
+    POST: Cập nhật notification preferences cho một location cụ thể
+    URL param: location_id (int)
+    Query/Body param: user_id (int)
+    """
+    from .serializers import LocationNotificationPreferencesSerializer
+    from .models import LocationNotificationPreferences, Location
+    from .preference_manager import UserPreferenceManager
+    
+    # Lấy user_id từ query params cho cả GET và POST
+    user_id = request.query_params.get('user_id')
+    
+    if not user_id:
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user_id = int(user_id)
+        location_id = int(location_id)
+        
+        # Kiểm tra user có tồn tại không
+        try:
+            user = User.objects.get(user_id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Kiểm tra location có tồn tại không
+        try:
+            location = Location.objects.get(location_id=location_id)
+        except Location.DoesNotExist:
+            return Response({'error': 'Location not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        if request.method == 'GET':
+            # Lấy preferences cho location
+            try:
+                location_pref = LocationNotificationPreferences.objects.get(
+                    user=user,
+                    location=location
+                )
+                serializer = LocationNotificationPreferencesSerializer(location_pref)
+                logger.info(f"[LOCATION PREFS API] Retrieved preferences for user {user_id}, location {location_id}")
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            except LocationNotificationPreferences.DoesNotExist:
+                # Nếu chưa có preferences cho location này, trả về default
+                return Response({
+                    'message': 'No preferences found for this location. Default will be created on first update.',
+                    'user_id': user_id,
+                    'location_id': location_id,
+                    'notifications_enabled': True  # Default value
+                }, status=status.HTTP_200_OK)
+        
+        elif request.method == 'POST':
+            # Cập nhật preferences cho location
+            logger.info(f"[LOCATION PREFS API] POST request data: {request.data}")
+            logger.info(f"[LOCATION PREFS API] Content-Type: {request.content_type}")
+            
+            notifications_enabled = request.data.get('notifications_enabled')
+            
+            if notifications_enabled is None:
+                logger.error(f"[LOCATION PREFS API] notifications_enabled is None. Full request.data: {request.data}")
+                return Response({'error': 'notifications_enabled is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Validate boolean
+            if not isinstance(notifications_enabled, bool):
+                return Response({'error': 'notifications_enabled must be a boolean'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Sử dụng UserPreferenceManager để cập nhật (truyền request để audit logging)
+            preference_manager = UserPreferenceManager()
+            result = preference_manager.update_location_preferences(
+                user_id=user_id,
+                location_id=location_id,
+                notifications_enabled=notifications_enabled,
+                request=request  # Truyền request để audit logging
+            )
+            
+            # Lấy lại object để serialize
+            location_pref = LocationNotificationPreferences.objects.get(
+                user=user,
+                location=location
+            )
+            serializer = LocationNotificationPreferencesSerializer(location_pref)
+            
+            logger.info(f"[LOCATION PREFS API] Updated preferences for user {user_id}, location {location_id}")
+            return Response({
+                'message': 'Location preferences updated successfully',
+                'preferences': serializer.data
+            }, status=status.HTTP_200_OK)
+    
+    except ValueError:
+        return Response({'error': 'Invalid user_id or location_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"[LOCATION PREFS API] Error: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# --- Notification History API Views ---
+
+@api_view(['GET'])
+# Cần thêm @permission_classes([IsAuthenticated]) sau này
+def notification_history(request):
+    """
+    GET: Lấy lịch sử thông báo của user với filtering và pagination
+    Query params:
+        - user_id (int, required): ID của user
+        - notification_type (str, optional): Lọc theo loại thông báo
+        - start_date (str, optional): Ngày bắt đầu (YYYY-MM-DD)
+        - end_date (str, optional): Ngày kết thúc (YYYY-MM-DD)
+        - page (int, optional): Số trang (default: 1)
+        - page_size (int, optional): Số items mỗi trang (default: 20, max: 100)
+    """
+    from .serializers import NotificationRecordSerializer
+    from .models import NotificationRecord
+    from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
+    
+    user_id = request.query_params.get('user_id')
+    
+    if not user_id:
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user_id = int(user_id)
+        
+        # Kiểm tra user có tồn tại không
+        try:
+            user = User.objects.get(user_id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Bắt đầu với queryset cơ bản
+        queryset = NotificationRecord.objects.filter(user=user).select_related('location', 'alert')
+        
+        # Lọc theo notification_type nếu có
+        notification_type = request.query_params.get('notification_type')
+        if notification_type:
+            queryset = queryset.filter(notification_type=notification_type)
+        
+        # Lọc theo khoảng thời gian
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        
+        if start_date:
+            try:
+                start_datetime = datetime.strptime(start_date, '%Y-%m-%d')
+                # Chuyển sang timezone-aware datetime
+                start_datetime = timezone.make_aware(start_datetime.replace(hour=0, minute=0, second=0))
+                queryset = queryset.filter(sent_at__gte=start_datetime)
+            except ValueError:
+                return Response({'error': 'Invalid start_date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if end_date:
+            try:
+                end_datetime = datetime.strptime(end_date, '%Y-%m-%d')
+                # Chuyển sang timezone-aware datetime, set to end of day
+                end_datetime = timezone.make_aware(end_datetime.replace(hour=23, minute=59, second=59))
+                queryset = queryset.filter(sent_at__lte=end_datetime)
+            except ValueError:
+                return Response({'error': 'Invalid end_date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Sắp xếp theo thời gian gửi (mới nhất trước)
+        queryset = queryset.order_by('-sent_at')
+        
+        # Pagination
+        page = request.query_params.get('page', 1)
+        page_size = request.query_params.get('page_size', 20)
+        
+        try:
+            page = int(page)
+            page_size = int(page_size)
+            
+            # Giới hạn page_size
+            if page_size > 100:
+                page_size = 100
+            if page_size < 1:
+                page_size = 20
+                
+        except ValueError:
+            return Response({'error': 'Invalid page or page_size format'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        paginator = Paginator(queryset, page_size)
+        
+        try:
+            notifications_page = paginator.page(page)
+        except PageNotAnInteger:
+            notifications_page = paginator.page(1)
+        except EmptyPage:
+            notifications_page = paginator.page(paginator.num_pages)
+        
+        serializer = NotificationRecordSerializer(notifications_page, many=True)
+        
+        logger.info(f"[HISTORY API] Retrieved {len(serializer.data)} notifications for user {user_id} (page {page})")
+        
+        return Response({
+            'count': paginator.count,
+            'num_pages': paginator.num_pages,
+            'current_page': notifications_page.number,
+            'page_size': page_size,
+            'has_next': notifications_page.has_next(),
+            'has_previous': notifications_page.has_previous(),
+            'results': serializer.data
+        }, status=status.HTTP_200_OK)
+    
+    except ValueError:
+        return Response({'error': 'Invalid user_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"[HISTORY API] Error: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+# Cần thêm @permission_classes([IsAuthenticated]) sau này
+def notification_history_detail(request, record_id):
+    """
+    GET: Lấy chi tiết một notification record cụ thể
+    URL param: record_id (int)
+    Query param: user_id (int, required)
+    """
+    from .serializers import NotificationRecordSerializer
+    from .models import NotificationRecord
+    
+    user_id = request.query_params.get('user_id')
+    
+    if not user_id:
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user_id = int(user_id)
+        record_id = int(record_id)
+        
+        # Kiểm tra user có tồn tại không
+        try:
+            user = User.objects.get(user_id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Lấy notification record
+        try:
+            notification = NotificationRecord.objects.select_related('location', 'alert').get(
+                record_id=record_id,
+                user=user
+            )
+        except NotificationRecord.DoesNotExist:
+            return Response({'error': 'Notification record not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = NotificationRecordSerializer(notification)
+        
+        logger.info(f"[HISTORY API] Retrieved notification detail {record_id} for user {user_id}")
+        
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    except ValueError:
+        return Response({'error': 'Invalid user_id or record_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"[HISTORY API] Error: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# --- Preference Audit Log API Views ---
+
+@api_view(['GET'])
+# Cần thêm @permission_classes([IsAuthenticated]) sau này
+def preference_audit_logs(request):
+    """
+    GET: Lấy audit logs của preference changes cho user
+    Query params:
+        - user_id (int, required): ID của user
+        - preference_type (str, optional): Lọc theo loại ('global' hoặc 'location')
+        - location_id (int, optional): Lọc theo location cụ thể
+        - start_date (str, optional): Ngày bắt đầu (YYYY-MM-DD)
+        - end_date (str, optional): Ngày kết thúc (YYYY-MM-DD)
+        - page (int, optional): Số trang (default: 1)
+        - page_size (int, optional): Số items mỗi trang (default: 20, max: 100)
+    """
+    from .models import PreferenceAuditLog
+    from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
+    
+    user_id = request.query_params.get('user_id')
+    
+    if not user_id:
+        return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user_id = int(user_id)
+        
+        # Kiểm tra user có tồn tại không
+        try:
+            user = User.objects.get(user_id=user_id)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Bắt đầu với queryset cơ bản
+        queryset = PreferenceAuditLog.objects.filter(user=user).select_related('location')
+        
+        # Lọc theo preference_type nếu có
+        preference_type = request.query_params.get('preference_type')
+        if preference_type:
+            queryset = queryset.filter(preference_type=preference_type)
+        
+        # Lọc theo location_id nếu có
+        location_id = request.query_params.get('location_id')
+        if location_id:
+            try:
+                location_id = int(location_id)
+                queryset = queryset.filter(location_id=location_id)
+            except ValueError:
+                return Response({'error': 'Invalid location_id format'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Lọc theo khoảng thời gian
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        
+        if start_date:
+            try:
+                start_datetime = datetime.strptime(start_date, '%Y-%m-%d')
+                start_datetime = timezone.make_aware(start_datetime.replace(hour=0, minute=0, second=0))
+                queryset = queryset.filter(changed_at__gte=start_datetime)
+            except ValueError:
+                return Response({'error': 'Invalid start_date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if end_date:
+            try:
+                end_datetime = datetime.strptime(end_date, '%Y-%m-%d')
+                end_datetime = timezone.make_aware(end_datetime.replace(hour=23, minute=59, second=59))
+                queryset = queryset.filter(changed_at__lte=end_datetime)
+            except ValueError:
+                return Response({'error': 'Invalid end_date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Sắp xếp theo thời gian thay đổi (mới nhất trước)
+        queryset = queryset.order_by('-changed_at')
+        
+        # Pagination
+        page = request.query_params.get('page', 1)
+        page_size = request.query_params.get('page_size', 20)
+        
+        try:
+            page = int(page)
+            page_size = int(page_size)
+            
+            if page_size > 100:
+                page_size = 100
+            if page_size < 1:
+                page_size = 20
+                
+        except ValueError:
+            return Response({'error': 'Invalid page or page_size format'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        paginator = Paginator(queryset, page_size)
+        
+        try:
+            logs_page = paginator.page(page)
+        except PageNotAnInteger:
+            logs_page = paginator.page(1)
+        except EmptyPage:
+            logs_page = paginator.page(paginator.num_pages)
+        
+        # Serialize data
+        results = []
+        for log in logs_page:
+            results.append({
+                'log_id': log.log_id,
+                'preference_type': log.preference_type,
+                'location_id': log.location.location_id if log.location else None,
+                'location_name': log.location.name_en if log.location else None,
+                'field_name': log.field_name,
+                'old_value': log.old_value,
+                'new_value': log.new_value,
+                'changed_at': log.changed_at,
+                'ip_address': log.ip_address,
+                'user_agent': log.user_agent
+            })
+        
+        logger.info(f"[AUDIT LOG API] Retrieved {len(results)} audit logs for user {user_id} (page {page})")
+        
+        return Response({
+            'count': paginator.count,
+            'num_pages': paginator.num_pages,
+            'current_page': logs_page.number,
+            'page_size': page_size,
+            'has_next': logs_page.has_next(),
+            'has_previous': logs_page.has_previous(),
+            'results': results
+        }, status=status.HTTP_200_OK)
+    
+    except ValueError:
+        return Response({'error': 'Invalid user_id format'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"[AUDIT LOG API] Error: {e}", exc_info=True)
+        return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST', 'DELETE'])
+@permission_classes([AllowAny])
+def delete_tracked_location(request):
+    """
+    Xóa một vị trí đã theo dõi
+    POST /api/locations/delete/?user_id=X&location_id=Y
+    DELETE /api/locations/delete/?user_id=X&location_id=Y
+    """
+    user_id = request.query_params.get('user_id') or request.data.get('user_id')
+    location_id = request.query_params.get('location_id') or request.data.get('location_id')
+    
+    if not user_id or not location_id:
+        return Response(
+            {'error': 'user_id and location_id are required'}, 
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        user_id = int(user_id)
+        location_id = int(location_id)
+        
+        # Tìm location
+        try:
+            location = Location.objects.get(location_id=location_id)
+        except Location.DoesNotExist:
+            return Response(
+                {'error': 'Location not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Kiểm tra user có trong danh sách users không
+        users_list = location.users or []
+        if user_id not in users_list:
+            return Response(
+                {'error': 'User is not tracking this location'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Xóa user khỏi danh sách
+        users_list.remove(user_id)
+        location.users = users_list
+        location.save()
+        
+        logger.info(f"[TRACK] User {user_id} untracked location {location_id}")
+        
+        return Response(
+            {'message': 'Location untracked successfully'},
+            status=status.HTTP_200_OK
+        )
+        
+    except ValueError:
+        return Response(
+            {'error': 'Invalid user_id or location_id'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    except Exception as e:
+        logger.error(f"[ERROR] delete_tracked_location: {e}", exc_info=True)
+        return Response(
+            {'error': 'Internal server error'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )

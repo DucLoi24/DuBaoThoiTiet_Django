@@ -147,3 +147,18 @@ LOGGING = {
         }
     },
 }
+
+# --- CUSTOM SETTINGS ---
+
+# Weather API Configuration
+WEATHER_API_KEY = os.getenv('WEATHER_API_KEY', '')
+BASE_WEATHER_URL = 'https://api.weatherapi.com/v1'
+
+# Firebase Cloud Messaging Configuration (HTTP v1 API)
+FIREBASE_SERVICE_ACCOUNT_PATH = os.path.join(BASE_DIR, 'firebase-service-account.json')
+
+# Admin Secret for protected endpoints
+ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'your-secret-key-here')
+
+# Cache Configuration
+CACHE_TTL_SECONDS = 300  # 5 minutes

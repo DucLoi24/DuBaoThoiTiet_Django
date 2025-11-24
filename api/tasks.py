@@ -61,46 +61,164 @@ def call_local_ai_for_advice(hourly_time_series_data):
     Prompt khác biệt: Ưu tiên lời khuyên, nhưng sẽ cảnh báo nếu có dấu hiệu cực đoan.
     Trả về dict: {"type": "advice" | "warning", "message_vi": "..."} hoặc None nếu lỗi.
     """
-
+    
+    # === PRE-PROCESSING: Phân tích dữ liệu trước khi gửi AI ===
+    if not hourly_time_series_data:
+        return {"type": "error", "message_vi": "Không có dữ liệu thời tiết để phân tích."}
+    
+    # Tính toán các chỉ số quan trọng
+    temps = [h.get('temp_c', 0) for h in hourly_time_series_data if h.get('temp_c') is not None]
+    winds = [h.get('wind_kph', 0) for h in hourly_time_series_data if h.get('wind_kph') is not None]
+    precips = [h.get('precip_mm', 0) for h in hourly_time_series_data if h.get('precip_mm') is not None]
+    rain_chances = [h.get('chance_of_rain', 0) for h in hourly_time_series_data if h.get('chance_of_rain') is not None]
+    
+    # Tính min/max/avg
+    temp_min = min(temps) if temps else 0
+    temp_max = max(temps) if temps else 0
+    temp_avg = sum(temps) / len(temps) if temps else 0
+    wind_max = max(winds) if winds else 0
+    wind_avg = sum(winds) / len(winds) if winds else 0
+    precip_total = sum(precips) if precips else 0
+    precip_max = max(precips) if precips else 0
+    rain_chance_max = max(rain_chances) if rain_chances else 0
+    
+    # Đếm số giờ có mưa to
+    heavy_rain_hours = sum(1 for p in precips if p > 10)
+    high_rain_chance_hours = sum(1 for r in rain_chances if r > 70)
+    
+    # Đếm số giờ nắng nóng (temp > 35)
+    hot_hours = sum(1 for t in temps if t > 35)
+    
+    # Đếm số giờ gió mạnh (wind > 40)
+    strong_wind_hours = sum(1 for w in winds if w > 40)
+    
+    # Đếm số giờ rét (temp < 10)
+    cold_hours = sum(1 for t in temps if t < 10)
+    
+    # Xác định loại cảnh báo dựa trên logic rõ ràng
+    warning_type = None
+    warning_details = {}
+    
+    # Cảnh báo lũ lụt (mưa to kéo dài)
+    if precip_total > 100 or (heavy_rain_hours >= 6 and precip_total > 50):
+        warning_type = "flood_risk"
+        warning_details = {
+            "precip_total": precip_total,
+            "precip_max": precip_max,
+            "heavy_rain_hours": heavy_rain_hours,
+            "risk_level": "high" if precip_total > 150 else "moderate"
+        }
+    # Cảnh báo mưa to
+    elif heavy_rain_hours >= 3 or (precip_max > 20 and high_rain_chance_hours >= 4):
+        warning_type = "heavy_rain"
+        warning_details = {
+            "precip_max": precip_max,
+            "precip_total": precip_total,
+            "heavy_rain_hours": heavy_rain_hours,
+            "rain_chance_max": rain_chance_max
+        }
+    # Cảnh báo nắng nóng nguy hiểm
+    elif hot_hours >= 4:
+        warning_type = "extreme_heat"
+        warning_details = {
+            "temp_max": temp_max,
+            "hot_hours": hot_hours,
+            "risk_level": "extreme" if temp_max > 39 else "high"
+        }
+    # Cảnh báo bão/gió mạnh
+    elif strong_wind_hours >= 3 or wind_max > 50:
+        warning_type = "strong_wind"
+        warning_details = {
+            "wind_max": wind_max,
+            "wind_avg": wind_avg,
+            "strong_wind_hours": strong_wind_hours,
+            "risk_level": "storm" if wind_max > 60 else "strong_wind"
+        }
+    # Cảnh báo rét đậm
+    elif cold_hours >= 6:
+        warning_type = "extreme_cold"
+        warning_details = {
+            "temp_min": temp_min,
+            "cold_hours": cold_hours,
+            "risk_level": "extreme" if temp_min < 5 else "high"
+        }
+    
+    # Tạo summary cho AI
+    weather_summary = {
+        "temp_range": f"{temp_min:.1f}°C - {temp_max:.1f}°C",
+        "temp_avg": f"{temp_avg:.1f}°C",
+        "wind_max": f"{wind_max:.1f} km/h",
+        "wind_avg": f"{wind_avg:.1f} km/h",
+        "precip_total": f"{precip_total:.1f} mm",
+        "precip_max": f"{precip_max:.1f} mm/giờ",
+        "rain_chance_max": f"{rain_chance_max}%",
+        "warning_detected": warning_type,
+        "warning_details": warning_details
+    }
+    
+    # Lấy ngày hôm nay
     today_str = timezone.localdate().strftime('%d/%m/%Y')
-    # --- PROMPT MỚI ---
-    prompt = f"""
-        **VAI TRÒ:**
-        Bạn là chuyên gia thời tiết địa phương tại Việt Nam, đưa ra lời khuyên/cảnh báo cho người dùng.
+    
+    # --- PROMPT ĐƠN GIẢN HÓA (SỬ DỤNG SUMMARY) ---
+    if warning_type:
+        # Mapping tên cảnh báo sang tiếng Việt
+        warning_names = {
+            "flood_risk": "nguy cơ lũ lụt",
+            "heavy_rain": "mưa to",
+            "extreme_heat": "nắng nóng nguy hiểm",
+            "strong_wind": "gió mạnh/bão",
+            "extreme_cold": "rét đậm"
+        }
+        warning_vn = warning_names.get(warning_type, warning_type)
+        
+        # Nếu đã phát hiện cảnh báo, yêu cầu AI viết message cảnh báo
+        prompt = f"""
+**VAI TRÒ:** Chuyên gia thời tiết Việt Nam viết cảnh báo cho người dùng.
 
-        **LƯU Ý QUAN TRỌNG:** Hôm nay là ngày **{today_str}**. Hãy tập trung phân tích và đưa ra kết luận cho **HÔM NAY và 1-3 NGÀY TỚI**. Dữ liệu quá khứ chỉ dùng để tham khảo xu hướng nếu cần.
+**NGÀY HÔM NAY:** {today_str}
 
-        **NHIỆM VỤ:**
-        Phân tích dữ liệu thời tiết THEO GIỜ (-3 đến +3 ngày) được cung cấp. Xác định hiện tượng **ảnh hưởng nhất** đến sinh hoạt trong **HÔM NAY và VÀI NGÀY TỚI**. Tạo MỘT KẾT LUẬN DUY NHẤT (JSON) gồm `type` ("warning"/"advice") và `message_vi` (2-4 câu giải thích + lời khuyên/cảnh báo hành động).
+**PHÂN TÍCH ĐÃ HOÀN TẤT:**
+- Nhiệt độ: {weather_summary['temp_range']} (TB: {weather_summary['temp_avg']})
+- Gió: Tối đa {weather_summary['wind_max']} (TB: {weather_summary['wind_avg']})
+- Mưa: Tổng {weather_summary['precip_total']}, tối đa {weather_summary['precip_max']}/giờ
+- Khả năng mưa: Tối đa {weather_summary['rain_chance_max']}
 
-        **DỮ LIỆU ĐẦU VÀO:**
-        Dữ liệu thời tiết THEO GIỜ:
-        {json.dumps(hourly_time_series_data, indent=2, default=str)}
-        # Các trường chính: 'time', 'temp_c', 'humidity', 'wind_kph', 'condition_text', 'uv', 'precip_mm', 'chance_of_rain'.
+**CẢNH BÁO PHÁT HIỆN:** {warning_vn}
+Chi tiết: {json.dumps(warning_details, ensure_ascii=False)}
 
-        **HƯỚNG DẪN SUY LUẬN & TẠO KẾT LUẬN (Tập trung vào hôm nay và dự báo):**
+**NHIỆM VỤ:** Viết cảnh báo ngắn gọn (2-3 câu) bằng tiếng Việt tự nhiên về {warning_vn} dựa trên số liệu trên. Bao gồm:
+- Mô tả nguy cơ cụ thể
+- Lời khuyên an toàn/phòng tránh
 
-        **A. ƯU TIÊN KIỂM TRA CẢNH BÁO (trong hôm nay & 3 ngày tới):**
-        * **Mưa Lớn/Ngập/Dông Sét Kéo Dài:** (Kiểm tra dữ liệu giờ của hôm nay và 3 ngày tới xem có dấu hiệu không). => Nếu có, kết luận `warning`.
-        * **Nắng Nóng Gay Gắt/Oi Bức:** (Kiểm tra dữ liệu giờ ban ngày của hôm nay và 3 ngày tới). => Nếu có, kết luận `warning`.
-        * **Gió Rất Mạnh/Giật:** (Kiểm tra dữ liệu giờ của hôm nay và 3 ngày tới). => Nếu có, kết luận `warning`.
-        * **Rét Đậm/Rét Hại:** (Kiểm tra dữ liệu giờ của hôm nay và 3 ngày tới). => Nếu có, kết luận `warning`.
+**ĐẦU RA (JSON):**
+{{"type": "warning", "message_vi": "Cảnh báo cụ thể với số liệu + lời khuyên hành động"}}
+"""
+    else:
+        # Không có cảnh báo, tạo lời khuyên
+        prompt = f"""
+**VAI TRÒ:** Chuyên gia thời tiết Việt Nam đưa lời khuyên cho người dùng.
 
-        **B. NẾU KHÔNG CÓ CẢNH BÁO (Tạo lời khuyên cho hôm nay & 1-2 ngày tới):**
-        * Xác định Kịch bản Chính cho **hôm nay và 1-2 ngày tới**.
-        * Tạo `advice` tập trung vào kịch bản đó kèm lời khuyên hành động cụ thể.
+**NGÀY HÔM NAY:** {today_str}
 
-        **YÊU CẦU ĐẦU RA:**
-        JSON duy nhất: `{{"type": "warning" | "advice", "message_vi": "[Kết luận + Lời khuyên hoặc Cảnh báo tập trung vào hôm nay và tương lai gần]"}}`.
-        **TUYỆT ĐỐI KHÔNG LẶP LẠI VÍ DỤ. TỰ DIỄN ĐẠT.**
-    """
-    # --- KẾT THÚC PROMPT MỚI ---
+**PHÂN TÍCH THỜI TIẾT 2-3 NGÀY TỚI:**
+- Nhiệt độ: {weather_summary['temp_range']} (TB: {weather_summary['temp_avg']})
+- Gió: Tối đa {weather_summary['wind_max']} (TB: {weather_summary['wind_avg']})
+- Mưa: Tổng {weather_summary['precip_total']}, khả năng tối đa {weather_summary['rain_chance_max']}
+
+**NHIỆM VỤ:** Viết lời khuyên ngắn gọn (2-3 câu) bằng tiếng Việt tự nhiên về:
+- Thời tiết chung (nắng/mát/mưa nhẹ...)
+- Hoạt động phù hợp (dã ngoại, thể thao, mang ô...)
+
+**ĐẦU RA (JSON):**
+{{"type": "advice", "message_vi": "Lời khuyên cụ thể dựa trên thời tiết"}}
+"""
+    # --- KẾT THÚC PROMPT ---
 
     try:
         logger.debug("[LOCAL AI ADVICE] Sending advice request to Ollama...")
         # Timeout có thể ngắn hơn cho lời khuyên, ví dụ 2 phút (120 giây)
         response = requests.post(settings.OLLAMA_API_URL, json={
-            "model": "gemma3:4b", # llama3.1:8b, gemma3:4b, deepseek-r1:7b
+            "model": "gemma3:4b", # gemma3:4b
             "prompt": prompt,
             "format": "json",
             "stream": False,
@@ -233,9 +351,10 @@ def call_local_ai_for_analysis(time_series_data):
 def trigger_data_ingestion():
     """ 
     Tác vụ thu thập dữ liệu lịch sử và dự báo (Cron job chạy hàng loạt) 
-    Hàm này giờ chỉ gọi hàm con 'ingest_data_for_single_location'.
+    Hàm này gọi hàm con 'ingest_data_for_single_location' cho từng location.
+    Hàm con sẽ tự động kiểm tra cảnh báo và gửi thông báo nếu cần.
     """
-    logger.info("--- [TASK START] Running Full Data Ingestion ---")
+    logger.info("--- [TASK START] Running Full Data Ingestion with Weather Monitoring ---")
     active_locations = Location.objects.filter(is_active=True)
     if not active_locations.exists():
         logger.info("[DATA INGESTION] No active locations.")
@@ -245,11 +364,12 @@ def trigger_data_ingestion():
 
     total_success = 0
     total_fail = 0
+    total_alerts_detected = 0
 
     # Vòng lặp này giờ đã sạch và đơn giản hơn rất nhiều
     for loc in active_locations:
         try:
-            # Gọi hàm con cho từng địa điểm
+            # Gọi hàm con cho từng địa điểm (bao gồm cả weather monitoring)
             success = ingest_data_for_single_location(loc.location_id) 
             if success:
                 total_success += 1
@@ -262,7 +382,7 @@ def trigger_data_ingestion():
             total_fail += 1
 
     errors_occurred = total_fail > 0
-    logger.info(f"--- [TASK FINISH] Data Ingestion completed. Succeeded for {total_success} locations. Failed for {total_fail} locations. ---")
+    logger.info(f"--- [TASK FINISH] Data Ingestion with Weather Monitoring completed. Succeeded for {total_success} locations. Failed for {total_fail} locations. ---")
     return {'success': not errors_occurred, 'message': f'Data Ingestion completed. Success: {total_success}, Fail: {total_fail}.'}
 
 # --- HÀM CON ĐỂ XỬ LÝ MỘT THÀNH PHỐ (ĐỊNH NGHĨA TRƯỚC) ---
@@ -360,7 +480,11 @@ def trigger_llm_analysis():
     return {'success': not any_critical_errors, 'message': f'Concurrent analysis completed. Created {alerts_created_count} alerts.'}
 
 def ingest_data_for_single_location(location_id):
-    """ Tác vụ thu thập dữ liệu tức thì cho MỘT địa điểm mới. """
+    """ 
+    Tác vụ thu thập dữ liệu tức thì cho MỘT địa điểm mới.
+    Sau khi thu thập, sẽ gọi WeatherConditionMonitor để phát hiện cảnh báo
+    và NotificationService để gửi thông báo nếu cần.
+    """
     try:
         loc = Location.objects.get(location_id=location_id)
         logger.info(f"[INSTANT INGEST] Running for new location: {loc.name_en} (ID: {loc.location_id})")
@@ -377,6 +501,7 @@ def ingest_data_for_single_location(location_id):
 
     all_records_to_insert = []
     errors_occurred = False
+    current_weather_data = None  # Lưu dữ liệu thời tiết hiện tại để phân tích
 
     # --- Lấy lịch sử ---
     logger.debug(f"[INSTANT INGEST] Fetching history for {loc.name_en}")
@@ -422,11 +547,54 @@ def ingest_data_for_single_location(location_id):
             created_records = WeatherData.objects.bulk_create(all_records_to_insert, ignore_conflicts=True)
             count = len(created_records)
             logger.info(f"[INSTANT INGEST] Stored {count} new unique records for {loc.name_en}.")
-            return True # Báo hiệu thành công
         except Exception as e:
             logger.error(f"[INSTANT INGEST] Error bulk inserting weather data for {loc.name_en}: {e}", exc_info=True)
             return False # Báo hiệu thất bại
     
+    # --- TÍCH HỢP GIÁM SÁT THỜI TIẾT ---
+    # Lấy dữ liệu thời tiết hiện tại để phân tích cảnh báo
+    logger.info(f"[INSTANT INGEST] Checking for weather alerts at {loc.name_en}")
+    
+    try:
+        # Lấy dữ liệu thời tiết hiện tại
+        current_data, current_err = call_weather_api_from_task('current', {'q': loc.name_en})
+        
+        if current_data and not current_err:
+            current_weather_data = current_data
+            
+            # Khởi tạo WeatherConditionMonitor
+            from .weather_monitor import WeatherConditionMonitor
+            monitor = WeatherConditionMonitor()
+            
+            # Đánh giá dữ liệu thời tiết và phát hiện cảnh báo
+            detected_alerts = monitor.evaluate_weather_data(current_weather_data, loc)
+            
+            if detected_alerts:
+                logger.info(f"[INSTANT INGEST] Detected {len(detected_alerts)} alert(s) for {loc.name_en}")
+                
+                # Gửi thông báo cho các cảnh báo đã phát hiện
+                from .notification_service import NotificationService
+                notification_service = NotificationService()
+                
+                for alert in detected_alerts:
+                    try:
+                        # Gửi cảnh báo đến tất cả users theo dõi location này
+                        send_result = notification_service.send_weather_alert(alert)
+                        logger.info(f"[INSTANT INGEST] Alert notification sent: {send_result}")
+                    except Exception as notify_err:
+                        logger.error(f"[INSTANT INGEST] Error sending alert notification: {notify_err}", exc_info=True)
+                        # Không fail toàn bộ task nếu gửi thông báo lỗi
+            else:
+                logger.debug(f"[INSTANT INGEST] No dangerous conditions detected for {loc.name_en}")
+        else:
+            logger.warning(f"[INSTANT INGEST] Could not fetch current weather data for alert monitoring: {current_err}")
+            # Không fail task nếu không lấy được dữ liệu current weather
+            
+    except Exception as monitor_err:
+        logger.error(f"[INSTANT INGEST] Error during weather monitoring: {monitor_err}", exc_info=True)
+        # Không fail toàn bộ task nếu monitoring lỗi, vì dữ liệu đã được lưu thành công
+    
+    # Trả về kết quả dựa trên việc lưu dữ liệu
     return not errors_occurred
 
 # @transaction.atomic
@@ -447,3 +615,492 @@ def ingest_data_for_single_location(location_id):
 #         logger.error(f"--- [TASK ERROR] Data Pruning: {e}", exc_info=True)
 #         return {'success': False, 'message': 'Error during Data Pruning.'}
 
+
+
+# --- TASK: KIỂM TRA THAY ĐỔI THỜI TIẾT VÀ GỬI THÔNG BÁO ---
+def check_weather_changes_and_notify():
+    """
+    Task chạy mỗi phút để kiểm tra thay đổi thời tiết cho các vị trí được theo dõi
+    và gửi push notification nếu có thay đổi
+    """
+    from .firebase_notifications import notify_weather_change, initialize_firebase
+    
+    logger.info("[WEATHER CHANGE CHECK] Starting weather change check...")
+    
+    # Khởi tạo Firebase (nếu chưa)
+    initialize_firebase()
+    
+    # Lấy tất cả locations đang được theo dõi (có users)
+    tracked_locations = Location.objects.filter(
+        is_active=True,
+        users__isnull=False
+    ).exclude(users=[])
+    
+    if not tracked_locations.exists():
+        logger.info("[WEATHER CHANGE CHECK] No tracked locations found")
+        return
+    
+    logger.info(f"[WEATHER CHANGE CHECK] Checking {tracked_locations.count()} locations")
+    
+    for location in tracked_locations:
+        try:
+            # Gọi API để lấy thời tiết hiện tại
+            weather_data, error = call_weather_api_from_task('current', {'q': location.name_en})
+            
+            if error or not weather_data:
+                logger.warning(f"[WEATHER CHANGE CHECK] Failed to fetch weather for {location.name_en}: {error}")
+                continue
+            
+            current_condition = weather_data.get('current', {}).get('condition', {}).get('text')
+            
+            if not current_condition:
+                logger.warning(f"[WEATHER CHANGE CHECK] No condition data for {location.name_en}")
+                continue
+            
+            # Log trạng thái hiện tại
+            logger.info(f"[WEATHER CHECK] {location.name_en}: last='{location.last_weather_condition}' current='{current_condition}'")
+            
+            # So sánh với trạng thái cũ
+            if location.last_weather_condition and location.last_weather_condition != current_condition:
+                # Có thay đổi! Gửi thông báo
+                logger.info(f"[WEATHER CHANGE] {location.name_en}: {location.last_weather_condition} → {current_condition}")
+                
+                # Lấy danh sách user IDs đang theo dõi location này
+                user_ids = location.users if location.users else []
+                
+                if user_ids:
+                    notify_weather_change(
+                        location_name=weather_data.get('location', {}).get('name', location.name_en),
+                        old_condition=location.last_weather_condition,
+                        new_condition=current_condition,
+                        user_ids=user_ids
+                    )
+            
+            # Cập nhật trạng thái mới
+            location.last_weather_condition = current_condition
+            location.last_weather_check = timezone.now()
+            location.save(update_fields=['last_weather_condition', 'last_weather_check'])
+            
+        except Exception as e:
+            logger.error(f"[WEATHER CHANGE CHECK] Error checking {location.name_en}: {e}", exc_info=True)
+    
+    logger.info("[WEATHER CHANGE CHECK] Completed weather change check")
+
+
+# --- SCHEDULED NOTIFICATION JOBS ---
+
+def send_morning_summary_job():
+    """
+    Job gửi tóm tắt buổi sáng lúc 7:00 AM hàng ngày
+    
+    Yêu cầu:
+    - 5.1: Gửi lúc 7:00 AM trong timezone của user
+    - 5.3: Chỉ gửi cho users có bật morning_summary_enabled
+    - 5.4: Chỉ gửi cho users có bật weekly_summary_enabled (cho weekly)
+    
+    Logic:
+    - Lọc users theo preferences đã bật
+    - Xử lý timezone cho thời gian gửi theo từng user
+    - Gọi ScheduledNotificationService để gửi
+    """
+    from .scheduled_notifications import ScheduledNotificationService
+    
+    logger.info("--- [JOB START] Morning Summary Job at 7:00 AM ---")
+    
+    try:
+        service = ScheduledNotificationService()
+        result = service.send_morning_summary()
+        
+        logger.info(f"[MORNING SUMMARY JOB] Completed: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[MORNING SUMMARY JOB] Error: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def send_tomorrow_forecast_job():
+    """
+    Job gửi dự báo ngày mai lúc 8:00 PM hàng ngày
+    
+    Yêu cầu:
+    - 6.1: Gửi lúc 8:00 PM trong timezone của user
+    - 6.3: Chỉ gửi cho users có bật tomorrow_forecast_enabled
+    - 6.4: Chỉ gửi cho users có bật weekly_summary_enabled (cho weekly)
+    
+    Logic:
+    - Lọc users theo preferences đã bật
+    - Xử lý timezone cho thời gian gửi theo từng user
+    - Gọi ScheduledNotificationService để gửi
+    """
+    from .scheduled_notifications import ScheduledNotificationService
+    
+    logger.info("--- [JOB START] Tomorrow Forecast Job at 8:00 PM ---")
+    
+    try:
+        service = ScheduledNotificationService()
+        result = service.send_tomorrow_forecast()
+        
+        logger.info(f"[TOMORROW FORECAST JOB] Completed: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[TOMORROW FORECAST JOB] Error: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def send_weekly_summary_job():
+    """
+    Job gửi tóm tắt tuần lúc 8:00 PM mỗi Chủ nhật
+    
+    Yêu cầu:
+    - 7.1: Gửi lúc 8:00 PM Chủ nhật trong timezone của user
+    - 7.3: Chỉ gửi cho users có bật weekly_summary_enabled
+    - 7.4: Chỉ gửi cho users có bật weekly_summary_enabled
+    
+    Logic:
+    - Lọc users theo preferences đã bật
+    - Xử lý timezone cho thời gian gửi theo từng user
+    - Gọi ScheduledNotificationService để gửi
+    """
+    from .scheduled_notifications import ScheduledNotificationService
+    
+    logger.info("--- [JOB START] Weekly Summary Job at 8:00 PM Sunday ---")
+    
+    try:
+        service = ScheduledNotificationService()
+        result = service.send_weekly_summary()
+        
+        logger.info(f"[WEEKLY SUMMARY JOB] Completed: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[WEEKLY SUMMARY JOB] Error: {e}", exc_info=True)
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def cleanup_notification_history_job():
+    """
+    Job dọn dẹp lịch sử thông báo cũ hơn 90 ngày
+    
+    Yêu cầu:
+    - 10.5: Lưu trữ lịch sử thông báo trong 90 ngày
+    
+    Logic:
+    - Xóa các bản ghi NotificationRecord cũ hơn 90 ngày
+    - Chạy lúc 2:00 AM hàng ngày để tránh ảnh hưởng đến hiệu suất
+    """
+    from .notification_service import NotificationService
+    
+    logger.info("--- [JOB START] Notification History Cleanup Job at 2:00 AM ---")
+    
+    try:
+        service = NotificationService()
+        result = service.cleanup_old_notification_records(retention_days=90)
+        
+        logger.info(f"[CLEANUP JOB] Completed: Deleted {result['deleted_count']} records older than {result['cutoff_date']}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[CLEANUP JOB] Error: {e}", exc_info=True)
+        return {
+            'deleted_count': 0,
+            'error': str(e)
+        }
+
+
+def cleanup_device_tokens_job():
+    """
+    Job dọn dẹp device tokens không active cũ hơn 90 ngày
+    
+    Yêu cầu:
+    - 16.4: Quản lý device tokens
+    
+    Logic:
+    - Xóa các device tokens không active cũ hơn 90 ngày
+    - Chạy lúc 3:00 AM mỗi Chủ nhật để tránh ảnh hưởng đến hiệu suất
+    """
+    from .models import DeviceToken
+    from django.utils import timezone
+    from datetime import timedelta
+    
+    logger.info("--- [JOB START] Device Tokens Cleanup Job at 3:00 AM Sunday ---")
+    
+    try:
+        cutoff_date = timezone.now() - timedelta(days=90)
+        
+        # Tìm các tokens không active và quá cũ
+        old_inactive_tokens = DeviceToken.objects.filter(
+            is_active=False,
+            updated_at__lt=cutoff_date
+        )
+        
+        count = old_inactive_tokens.count()
+        
+        if count == 0:
+            logger.info("[CLEANUP JOB] No device tokens to clean up")
+            return {
+                'deleted_count': 0,
+                'cutoff_date': cutoff_date.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        
+        # Xóa tokens
+        deleted_count, _ = old_inactive_tokens.delete()
+        
+        logger.info(f"[CLEANUP JOB] Completed: Deleted {deleted_count} inactive device tokens older than 90 days")
+        
+        # Thống kê tokens hiện tại
+        active_count = DeviceToken.objects.filter(is_active=True).count()
+        inactive_count = DeviceToken.objects.filter(is_active=False).count()
+        
+        logger.info(f"[CLEANUP JOB] Current stats - Active: {active_count}, Inactive: {inactive_count}")
+        
+        return {
+            'deleted_count': deleted_count,
+            'cutoff_date': cutoff_date.strftime('%Y-%m-%d %H:%M:%S'),
+            'active_tokens': active_count,
+            'inactive_tokens': inactive_count
+        }
+        
+    except Exception as e:
+        logger.error(f"[CLEANUP JOB] Error: {e}", exc_info=True)
+        return {
+            'deleted_count': 0,
+            'error': str(e)
+        }
+
+
+def monitor_all_locations_for_alerts():
+    """
+    Job chạy mỗi 30 phút để phát hiện cảnh báo thiên tai REAL-TIME.
+    Phân tích tất cả locations đang active và gửi push notification ngay lập tức.
+    """
+    logger.info("--- [REAL-TIME ALERT MONITOR] Starting real-time weather alert monitoring ---")
+    
+    active_locations = Location.objects.filter(is_active=True)
+    
+    if not active_locations.exists():
+        logger.info("[REAL-TIME ALERT] No active locations to monitor")
+        return {
+            'success': True,
+            'monitored_count': 0,
+            'alerts_detected': 0
+        }
+    
+    logger.info(f"[REAL-TIME ALERT] Monitoring {active_locations.count()} locations")
+    
+    total_alerts = 0
+    total_notifications_sent = 0
+    
+    for location in active_locations:
+        try:
+            # Phân tích location và gửi notification nếu có cảnh báo
+            _, alerts, error = analyze_location_with_preprocessing(location)
+            
+            if alerts:
+                total_alerts += len(alerts)
+                logger.info(f"[REAL-TIME ALERT] Detected {len(alerts)} alert(s) for {location.name_en}")
+            
+        except Exception as e:
+            logger.error(f"[REAL-TIME ALERT] Error monitoring {location.name_en}: {e}", exc_info=True)
+    
+    logger.info(f"--- [REAL-TIME ALERT MONITOR] Completed. Detected {total_alerts} alerts ---")
+    
+    return {
+        'success': True,
+        'monitored_count': active_locations.count(),
+        'alerts_detected': total_alerts
+    }
+
+
+def analyze_location_with_preprocessing(location):
+    """
+    Phân tích location với logic pre-processing mới.
+    Phát hiện: heavy_rain, flood_risk, extreme_heat, strong_wind, extreme_cold
+    Trả về: (location, alerts_list, error_message)
+    """
+    from .firebase_notifications import send_weather_alert_notification
+    from .models import DeviceToken, LocationNotificationPreferences
+    
+    try:
+        # Lấy dữ liệu dự báo 3 ngày từ API
+        forecast_data, err = call_weather_api_from_task('forecast', {'q': location.name_en, 'days': 3})
+        
+        if not forecast_data or 'forecast' not in forecast_data:
+            logger.error(f"[PREPROCESSING] Failed to fetch forecast for {location.name_en}: {err}")
+            return location, [], "API Error"
+        
+        # Chuyển đổi sang hourly data
+        hourly_data = []
+        for day in forecast_data['forecast']['forecastday']:
+            hourly_data.extend(day.get('hour', []))
+        
+        if not hourly_data:
+            return location, [], "No hourly data"
+        
+        # === LOGIC PRE-PROCESSING (GIỐNG TRONG call_local_ai_for_advice) ===
+        temps = [h.get('temp_c', 0) for h in hourly_data if h.get('temp_c') is not None]
+        winds = [h.get('wind_kph', 0) for h in hourly_data if h.get('wind_kph') is not None]
+        precips = [h.get('precip_mm', 0) for h in hourly_data if h.get('precip_mm') is not None]
+        rain_chances = [h.get('chance_of_rain', 0) for h in hourly_data if h.get('chance_of_rain') is not None]
+        
+        temp_min = min(temps) if temps else 0
+        temp_max = max(temps) if temps else 0
+        wind_max = max(winds) if winds else 0
+        precip_total = sum(precips) if precips else 0
+        precip_max = max(precips) if precips else 0
+        
+        heavy_rain_hours = sum(1 for p in precips if p > 10)
+        high_rain_chance_hours = sum(1 for r in rain_chances if r > 70)
+        hot_hours = sum(1 for t in temps if t > 35)
+        strong_wind_hours = sum(1 for w in winds if w > 40)
+        cold_hours = sum(1 for t in temps if t < 10)
+        
+        # Phát hiện cảnh báo
+        alerts = []
+        
+        # Lũ lụt (ưu tiên cao nhất)
+        if precip_total > 100 or (heavy_rain_hours >= 6 and precip_total > 50):
+            alerts.append({
+                'severity': 'EXTREME' if precip_total > 150 else 'HIGH',
+                'impact_field': 'flood_risk',
+                'forecast_details_vi': f'Nguy cơ lũ lụt cao. Tổng lượng mưa dự báo: {precip_total:.1f}mm trong 3 ngày tới. Mưa to kéo dài {heavy_rain_hours} giờ.',
+                'actionable_advice_vi': 'Chuẩn bị sơ tán nếu ở vùng trũng. Tránh đi qua vùng ngập. Theo dõi tin tức địa phương.'
+            })
+        
+        # Mưa to
+        elif heavy_rain_hours >= 3 or (precip_max > 20 and high_rain_chance_hours >= 4):
+            alerts.append({
+                'severity': 'HIGH',
+                'impact_field': 'heavy_rain',
+                'forecast_details_vi': f'Mưa to dự báo. Lượng mưa tối đa: {precip_max:.1f}mm/giờ. Tổng: {precip_total:.1f}mm.',
+                'actionable_advice_vi': 'Mang theo áo mưa, ô. Hạn chế di chuyển khi mưa lớn. Cẩn thận đường trơn.'
+            })
+        
+        # Nắng nóng
+        if hot_hours >= 4:
+            alerts.append({
+                'severity': 'EXTREME' if temp_max > 39 else 'HIGH',
+                'impact_field': 'extreme_heat',
+                'forecast_details_vi': f'Nắng nóng gay gắt. Nhiệt độ cao nhất: {temp_max:.1f}°C. Kéo dài {hot_hours} giờ.',
+                'actionable_advice_vi': 'Hạn chế ra ngoài 11h-15h. Uống nhiều nước. Mặc quần áo thoáng mát. Cẩn thận say nắng.'
+            })
+        
+        # Bão/Gió mạnh - Phân cấp chi tiết
+        if wind_max >= 185:  # Siêu bão
+            alerts.append({
+                'severity': 'EXTREME',
+                'impact_field': 'super_typhoon',
+                'forecast_details_vi': f'⚠️ SIÊU BÃO CẤP 5 DỰ BÁO! Tốc độ gió tối đa: {wind_max:.1f} km/h. Cực kỳ nguy hiểm!',
+                'actionable_advice_vi': 'KHẨN CẤP: Sơ tán ngay lập tức! Tìm nơi trú ẩn kiên cố. Tuyệt đối không ra ngoài.'
+            })
+        elif wind_max >= 118:  # Bão mạnh
+            alerts.append({
+                'severity': 'EXTREME',
+                'impact_field': 'typhoon',
+                'forecast_details_vi': f'🌀 BÃO MẠNH DỰ BÁO! Tốc độ gió tối đa: {wind_max:.1f} km/h. Rất nguy hiểm!',
+                'actionable_advice_vi': 'KHẨN CẤP: Gia cố nhà cửa ngay. Chuẩn bị sơ tán. Tránh ra ngoài. Dự trữ lương thực, nước.'
+            })
+        elif wind_max >= 63:  # Bão nhiệt đới
+            alerts.append({
+                'severity': 'HIGH',
+                'impact_field': 'tropical_storm',
+                'forecast_details_vi': f'🌀 BÃO NHIỆT ĐỚI dự báo. Tốc độ gió tối đa: {wind_max:.1f} km/h. Kéo dài {strong_wind_hours} giờ.',
+                'actionable_advice_vi': 'Gia cố nhà cửa. Hạn chế ra ngoài. Cẩn thận cây đổ, biển hiệu bay. Đóng cửa sổ chặt.'
+            })
+        elif wind_max >= 39:  # Áp thấp nhiệt đới
+            alerts.append({
+                'severity': 'HIGH',
+                'impact_field': 'tropical_depression',
+                'forecast_details_vi': f'🌪️ ÁP THẤP NHIỆT ĐỚI dự báo. Tốc độ gió tối đa: {wind_max:.1f} km/h. Kéo dài {strong_wind_hours} giờ.',
+                'actionable_advice_vi': 'Cẩn thận khi ra ngoài. Gia cố vật dụng dễ bay. Đóng cửa sổ. Theo dõi tin tức.'
+            })
+        elif strong_wind_hours >= 3 or wind_max >= 50:  # Gió mạnh
+            alerts.append({
+                'severity': 'MEDIUM',
+                'impact_field': 'strong_wind',
+                'forecast_details_vi': f'💨 Gió mạnh dự báo. Tốc độ gió tối đa: {wind_max:.1f} km/h. Kéo dài {strong_wind_hours} giờ.',
+                'actionable_advice_vi': 'Cẩn thận khi di chuyển. Tránh đứng dưới cây, biển hiệu. Gia cố vật dụng nhẹ.'
+            })
+        
+        # Rét đậm
+        if cold_hours >= 6:
+            alerts.append({
+                'severity': 'EXTREME' if temp_min < 5 else 'HIGH',
+                'impact_field': 'extreme_cold',
+                'forecast_details_vi': f'Rét đậm. Nhiệt độ thấp nhất: {temp_min:.1f}°C. Kéo dài {cold_hours} giờ.',
+                'actionable_advice_vi': 'Mặc ấm. Cẩn thận với người già, trẻ em. Đề phòng bệnh đường hô hấp.'
+            })
+        
+        # Nếu có cảnh báo, push notification ngay
+        if alerts:
+            logger.info(f"[PREPROCESSING] Detected {len(alerts)} alert(s) for {location.name_en}")
+            
+            # Lấy users theo dõi location này
+            user_ids = location.users if location.users else []
+            
+            for alert in alerts:
+                # Lưu vào database
+                try:
+                    event = ExtremeEvent.objects.create(
+                        location=location,
+                        severity=alert['severity'],
+                        impact_field=alert['impact_field'],
+                        forecast_details_vi=alert['forecast_details_vi'],
+                        actionable_advice_vi=alert['actionable_advice_vi'],
+                        raw_llm_json=alert,
+                        is_notified=False
+                    )
+                    
+                    # Push notification cho từng user
+                    for user_id in user_ids:
+                        try:
+                            # Kiểm tra preferences
+                            location_pref = LocationNotificationPreferences.objects.filter(
+                                user_id=user_id,
+                                location=location
+                            ).first()
+                            
+                            # Nếu user tắt notification cho location này, skip
+                            if location_pref and not location_pref.notifications_enabled:
+                                continue
+                            
+                            # Lấy device tokens
+                            tokens = list(DeviceToken.objects.filter(
+                                user_id=user_id,
+                                is_active=True
+                            ).values_list('token', flat=True))
+                            
+                            if tokens:
+                                # Push notification
+                                send_weather_alert_notification(
+                                    device_tokens=tokens,
+                                    location_name=location.name_en,
+                                    alert=event
+                                )
+                                logger.info(f"[PUSH] Sent {alert['impact_field']} alert to user {user_id}")
+                        
+                        except Exception as push_err:
+                            logger.error(f"[PUSH] Error sending to user {user_id}: {push_err}")
+                    
+                    # Đánh dấu đã gửi
+                    event.is_notified = True
+                    event.save()
+                    
+                except Exception as db_err:
+                    logger.error(f"[DB] Error saving alert for {location.name_en}: {db_err}")
+        
+        return location, alerts, None
+        
+    except Exception as e:
+        logger.error(f"[PREPROCESSING] Error analyzing {location.name_en}: {e}", exc_info=True)
+        return location, [], str(e)
