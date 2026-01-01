@@ -444,5 +444,3 @@ python manage.py shell
 >>> from django.core.cache import cache
 >>> cache.clear()
 ```
-
-**Last Updated**: 2025-01-24
