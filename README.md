@@ -445,17 +445,4 @@ python manage.py shell
 >>> cache.clear()
 ```
 
-## 👥 Contributors
-
-- Development Team
-
-## 📞 Support
-
-Nếu gặp vấn đề, vui lòng:
-1. Kiểm tra [Troubleshooting](#-troubleshooting)
-2. Xem [Documentation](docs/)
-3. Liên hệ team
-
----
-
 **Last Updated**: 2025-01-24
